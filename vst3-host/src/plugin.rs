@@ -855,6 +855,20 @@ pub(crate) trait PluginInternal: Send {
     fn output_parameter_refusals(&self) -> u64 {
         0
     }
+    /// Have `process` move the editor's gesture log into a buffer of `capacity`. Defaults to
+    /// doing nothing, for implementations whose `process` does not run in this process; their
+    /// gestures stay with [`Self::take_parameter_edits`].
+    fn capture_parameter_edits(&mut self, _capacity: usize) -> Result<()> {
+        Ok(())
+    }
+    /// Hand `each` the gestures `process` captured, oldest first. Defaults to none.
+    fn drain_heard_parameter_edits(&mut self, _each: &mut dyn FnMut(i32, &ParameterEdit)) -> usize {
+        0
+    }
+    /// Gestures lost at the log's cap or past the capture's buffer. Defaults to 0.
+    fn parameter_edit_refusals(&self) -> u64 {
+        0
+    }
     /// Queue a copy of a SysEx message. Defaults to an owned copy through
     /// [`Self::send_plugin_event`], which allocates.
     fn send_sysex_from_slice_at(&mut self, bytes: &[u8], sample_offset: i32) -> bool {
@@ -1806,6 +1820,52 @@ impl Plugin {
         self.internal
             .as_ref()
             .map_or(0, |internal| internal.output_parameter_refusals())
+    }
+
+    /// Have `process` take the editor's gesture log as it hears the values, into a buffer of
+    /// `capacity` gestures reserved here, for the audio thread to read after each block with
+    /// [`drain_heard_parameter_edits`](Self::drain_heard_parameter_edits).
+    ///
+    /// Without it a host reads the gestures with [`take_parameter_edits`](Self::take_parameter_edits),
+    /// on its own thread and with no block to place them in. After it, each block moves the log
+    /// into the buffer in the chunk whose processor took the values, so a gesture is placed at
+    /// the block, and the frame of the block, the plugin heard it in; a gesture is never placed
+    /// before then, and is placed a block late only when `performEdit` was between its two
+    /// pushes as the block started. `take_parameter_edits` then finds only what no block has
+    /// taken yet. A gesture past `capacity` in one block, or past the log's own cap of 4096
+    /// between two blocks, is dropped and counted in
+    /// [`parameter_edit_refusals`](Self::parameter_edit_refusals). It allocates, so call it
+    /// before the audio thread runs; a later call replaces the buffer and its gestures, and a
+    /// `capacity` of 0 stops the capture. An isolated plugin captures nothing.
+    pub fn capture_parameter_edits(&mut self, capacity: usize) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .capture_parameter_edits(capacity)
+    }
+
+    /// Hand `each` the gestures the last block's `process` heard, oldest first, with the frame
+    /// of that block each one's value reached the processor at, and empty the buffer. Returns
+    /// how many. For the audio thread, after `process_audio`: it takes no lock and allocates and
+    /// frees nothing. None unless [`capture_parameter_edits`](Self::capture_parameter_edits) was
+    /// called.
+    pub fn drain_heard_parameter_edits(
+        &mut self,
+        mut each: impl FnMut(i32, &ParameterEdit),
+    ) -> usize {
+        self.internal.as_mut().map_or(0, |internal| {
+            internal.drain_heard_parameter_edits(&mut each)
+        })
+    }
+
+    /// How many of the editor's gestures were lost since the plugin loaded: refused because
+    /// the log held 4096 that nothing had taken, or past the buffer
+    /// [`capture_parameter_edits`](Self::capture_parameter_edits) reserved in one block. It
+    /// reads an atomic, so the audio thread may call it after a block.
+    pub fn parameter_edit_refusals(&self) -> u64 {
+        self.internal
+            .as_ref()
+            .map_or(0, |internal| internal.parameter_edit_refusals())
     }
 
     /// Queue a copy of the SysEx message `bytes` at a sample offset within the next process

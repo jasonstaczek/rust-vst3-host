@@ -19,6 +19,13 @@ All notable changes to `vst3-host` are documented here. The format is based on
   `Plugin::reserve_output_parameters` preallocates the queues `outputParameterChanges` hands
   out and stops them growing; a parameter or a point past them is refused and counted in
   `Plugin::output_parameter_refusals`. Without the call the pool still grows in `process`.
+- **The editor's gestures can be read on the audio thread, placed at the block that heard
+  them.** `Plugin::capture_parameter_edits` reserves a buffer that `process` moves the gesture
+  log into, in the chunk whose processor took the values, and
+  `Plugin::drain_heard_parameter_edits` hands them over after the block with the frame each
+  was heard at, taking no lock. A host no longer needs the plugin on its own thread to read
+  them. Gestures lost at the log's cap or past the buffer are counted in
+  `Plugin::parameter_edit_refusals`. Without the call the log is `take_parameter_edits`' alone.
 
 ### Added
 

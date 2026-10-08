@@ -1641,6 +1641,9 @@ pub struct ComponentHandler {
     // richer superset of `parameter_changes` (which keeps only the value changes for the DSP).
     // Ordered against itself only — see the type comment about the group-edit brackets.
     edits: Arc<Mutex<Vec<crate::plugin::ParameterEdit>>>,
+    // Gestures refused at `MAX_EDITOR_FEEDBACK`, here or by the audio thread's capture of the
+    // log (`Plugin::capture_parameter_edits`), counted so a host can say some were lost.
+    edit_refusals: AtomicU64,
     // Union of every `restartComponent` flag the plugin has raised since the host last drained
     // it. A bitmask rather than a log: the flags are idempotent requests ("my latency changed",
     // "re-read my parameters"), so accumulating them is both complete and inherently bounded —
@@ -1660,6 +1663,7 @@ impl ComponentHandler {
         ComponentHandler {
             parameter_changes,
             edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
+            edit_refusals: AtomicU64::new(0),
             restart_flags: AtomicI32::new(0),
             notifications: Arc::new(Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS))),
             context_menus: Arc::new(ContextMenuRegistry::new()),
@@ -1723,7 +1727,24 @@ impl ComponentHandler {
         let mut edits = self.edits.lock().unwrap_or_else(|p| p.into_inner());
         if edits.len() < MAX_EDITOR_FEEDBACK {
             edits.push(edit);
+        } else {
+            self.count_edit_refusal();
         }
+    }
+
+    /// The gesture log itself, for the audio thread's capture, which only `try_lock`s it.
+    pub(crate) fn edit_log(&self) -> &Mutex<Vec<crate::plugin::ParameterEdit>> {
+        &self.edits
+    }
+
+    /// Count one gesture lost: refused at the log's cap, or past the capture's buffer.
+    pub(crate) fn count_edit_refusal(&self) {
+        self.edit_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Gestures lost since the plugin loaded; see [`Self::count_edit_refusal`].
+    pub(crate) fn edit_refusals(&self) -> u64 {
+        self.edit_refusals.load(Ordering::Relaxed)
     }
 
     fn push_notification(&self, notification: crate::plugin::HostNotification) -> bool {
@@ -2997,6 +3018,11 @@ mod component_handler_tests {
             edits.len(),
             MAX_EDITOR_FEEDBACK,
             "the gesture log must stop at the cap too"
+        );
+        assert_eq!(
+            handler.edit_refusals(),
+            MAX_EDITOR_FEEDBACK as u64,
+            "each gesture refused at the cap is counted"
         );
 
         // Draining keeps the buffer's capacity, so the next gesture doesn't reallocate on the

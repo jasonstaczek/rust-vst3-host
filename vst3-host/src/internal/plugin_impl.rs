@@ -213,6 +213,10 @@ pub struct PluginImpl {
     // (`component_handler.parameter_changes`) so feeding the DSP and updating the display are
     // not two consumers racing to drain the same buffer.
     gui_param_changes_for_host: Arc<Mutex<Vec<(u32, f64)>>>,
+    // The editor's gesture log as `process` heard it, each with the frame of the caller's block
+    // its value reached the processor at, for the host to drain after the block. Empty, and
+    // never filled, until `capture_parameter_edits` reserves it; never grown past that.
+    heard_edits: Vec<(i32, crate::plugin::ParameterEdit)>,
     // Processor-originated output parameter points. Bounded and lock-free: process() pushes,
     // the host/UI drains through get_parameter_changes().
     output_param_feedback: Arc<ArrayQueue<(u32, f64)>>,
@@ -1516,6 +1520,7 @@ impl PluginImpl {
                 gui_param_changes_for_host: Arc::new(Mutex::new(Vec::with_capacity(
                     MAX_EDITOR_FEEDBACK,
                 ))),
+                heard_edits: Vec::new(),
                 output_param_feedback: Arc::new(ArrayQueue::new(MAX_OUTPUT_PARAMETER_FEEDBACK)),
                 output_param_changes: ComWrapper::new(ParameterChanges::default()),
                 deferred_controller_sync: ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC),
@@ -2120,10 +2125,18 @@ impl PluginImpl {
                 // twice in the same block, which is idempotent.) Drained here at offset 0 and
                 // stashed for the host's display poll (get_parameter_changes).
                 if let Some(ref handler) = self.component_handler {
+                    // The gestures go with the values only when a host asked for them here;
+                    // otherwise they stay in the log for `take_parameter_edits`.
+                    let heard = (self.heard_edits.capacity() > 0).then(|| HeardEdits {
+                        handler,
+                        heard: &mut self.heard_edits,
+                        offset: i32::try_from(frame_offset).unwrap_or(i32::MAX),
+                    });
                     drain_editor_edits(
                         &handler.parameter_changes,
                         &data.input_param_changes,
                         &self.gui_param_changes_for_host,
+                        heard,
                     );
                 }
 
@@ -2894,6 +2907,29 @@ impl PluginInternal for PluginImpl {
 
     fn output_parameter_refusals(&self) -> u64 {
         self.output_param_changes.refused()
+    }
+
+    fn capture_parameter_edits(&mut self, capacity: usize) -> Result<()> {
+        // A replacement, not a `reserve` on top: a host shrinking the buffer gets what it asked.
+        self.heard_edits = Vec::with_capacity(capacity);
+        Ok(())
+    }
+
+    fn drain_heard_parameter_edits(
+        &mut self,
+        each: &mut dyn FnMut(i32, &crate::plugin::ParameterEdit),
+    ) -> usize {
+        let drained = self.heard_edits.len();
+        for (offset, edit) in self.heard_edits.drain(..) {
+            each(offset, &edit);
+        }
+        drained
+    }
+
+    fn parameter_edit_refusals(&self) -> u64 {
+        self.component_handler
+            .as_ref()
+            .map_or(0, |handler| handler.edit_refusals())
     }
 
     fn send_sysex_from_slice_at(&mut self, bytes: &[u8], sample_offset: i32) -> bool {
@@ -4557,8 +4593,40 @@ fn chunk_offset(
     }
 }
 
+/// Where the audio thread puts the editor's gestures as `process` hears them
+/// (`Plugin::capture_parameter_edits`): the buffer, and the chunk's frame in the caller's block.
+struct HeardEdits<'a> {
+    handler: &'a ComponentHandler,
+    heard: &'a mut Vec<(i32, crate::plugin::ParameterEdit)>,
+    offset: i32,
+}
+
+impl HeardEdits<'_> {
+    /// Move the whole gesture log into the buffer at this chunk's frame. Called only while the
+    /// value list is held and its values delivered, so `performEdit`, which pushes a value
+    /// before its gesture and never holds both locks, cannot have a gesture here whose value
+    /// is still to come: each one is heard in this chunk or was heard earlier, never later. A
+    /// held log is left for the next chunk, which stamps its gestures late, never early. A
+    /// gesture past the buffer's reserve is dropped and counted; nothing allocates or frees.
+    fn take(self) {
+        let mut log = match self.handler.edit_log().try_lock() {
+            Ok(log) => log,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        for edit in log.drain(..) {
+            if self.heard.len() < self.heard.capacity() {
+                self.heard.push((self.offset, edit));
+            } else {
+                self.handler.count_edit_refusal();
+            }
+        }
+    }
+}
+
 /// Move the edits the plugin's editor made with `performEdit` into the processor's input
-/// queue at offset 0, and into the stash the host's display poll drains.
+/// queue at offset 0, and into the stash the host's display poll drains; then, when `heard`
+/// is given, the gesture log into it (see [`HeardEdits::take`]).
 ///
 /// Runs on the audio thread, so it never waits: `performEdit` takes `edits` on the editor's
 /// thread and the host's poll takes `stash` on its own, and either may hold its lock when a
@@ -4570,10 +4638,24 @@ fn drain_editor_edits(
     edits: &Mutex<Vec<(u32, f64)>>,
     input: &ParameterChanges,
     stash: &Mutex<Vec<(u32, f64)>>,
+    heard: Option<HeardEdits<'_>>,
 ) -> bool {
     let Ok(mut gui_changes) = edits.try_lock() else {
         return false;
     };
+    let delivered = deliver_editor_edits(&mut gui_changes, input, stash);
+    if let Some(heard) = heard.filter(|_| delivered) {
+        heard.take();
+    }
+    delivered
+}
+
+/// The body of [`drain_editor_edits`], with the value list held.
+fn deliver_editor_edits(
+    gui_changes: &mut Vec<(u32, f64)>,
+    input: &ParameterChanges,
+    stash: &Mutex<Vec<(u32, f64)>>,
+) -> bool {
     if gui_changes.is_empty() {
         return true;
     }
@@ -4597,7 +4679,7 @@ fn drain_editor_edits(
     // steady-state append allocates nothing.
     let room = MAX_EDITOR_FEEDBACK.saturating_sub(stash.len());
     if room >= gui_changes.len() {
-        stash.append(&mut gui_changes);
+        stash.append(gui_changes);
     } else {
         stash.extend(gui_changes.drain(..room));
         gui_changes.clear();
@@ -5567,7 +5649,7 @@ mod editor_edit_drain_tests {
         let answer = thread::scope(|s| {
             s.spawn(|| {
                 done_tx
-                    .send(drain_editor_edits(edits, input, stash))
+                    .send(drain_editor_edits(edits, input, stash, None))
                     .unwrap()
             });
             let answer = done_rx.recv_timeout(Duration::from_secs(10));
@@ -5602,7 +5684,7 @@ mod editor_edit_drain_tests {
             "the edits are kept for the next block"
         );
 
-        assert!(drain_editor_edits(&edits, &input, &stash));
+        assert!(drain_editor_edits(&edits, &input, &stash, None));
         assert_eq!(unsafe { input.getParameterCount() }, 2);
         assert!(edits.lock().unwrap().is_empty());
         assert_eq!(*stash.lock().unwrap(), vec![(7, 0.25), (9, 0.5)]);
@@ -5623,8 +5705,145 @@ mod editor_edit_drain_tests {
         assert_eq!(unsafe { input.getParameterCount() }, 0);
         assert_eq!(*edits.lock().unwrap(), vec![(3, 1.0)]);
 
-        assert!(drain_editor_edits(&edits, &input, &stash));
+        assert!(drain_editor_edits(&edits, &input, &stash, None));
         assert_eq!(unsafe { input.getParameterCount() }, 1);
         assert_eq!(*stash.lock().unwrap(), vec![(3, 1.0)]);
+    }
+
+    use crate::plugin::{ParameterEdit, ParameterEditKind};
+
+    type Heard = Vec<(i32, ParameterEdit)>;
+
+    /// A handler whose editor began a gesture on parameter 7 and set it to 0.25, as
+    /// `performEdit` leaves it: the value in the value list, the gestures in the log.
+    fn handler_with_a_gesture() -> ComponentHandler {
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::with_capacity(
+            MAX_EDITOR_FEEDBACK,
+        ))));
+        unsafe {
+            handler.beginEdit(7);
+            handler.performEdit(7, 0.25);
+        }
+        handler
+    }
+
+    fn begin(id: u32) -> ParameterEdit {
+        ParameterEdit {
+            id,
+            kind: ParameterEditKind::BeginGesture,
+            value: None,
+        }
+    }
+
+    fn value(id: u32, value: f64) -> ParameterEdit {
+        ParameterEdit {
+            id,
+            kind: ParameterEditKind::ValueChange,
+            value: Some(value),
+        }
+    }
+
+    /// One capturing drain at chunk frame `offset`, as `process_chunk` makes it.
+    fn capture(
+        handler: &ComponentHandler,
+        input: &ParameterChanges,
+        stash: &Edits,
+        heard: &mut Heard,
+        offset: i32,
+    ) -> bool {
+        let heard = HeardEdits {
+            handler,
+            heard,
+            offset,
+        };
+        drain_editor_edits(&handler.parameter_changes, input, stash, Some(heard))
+    }
+
+    /// Runs `f` while another thread holds `held`, or fails after ten seconds: `f` waiting on
+    /// the lock fails rather than hangs.
+    fn while_held<T: Send, R: Send>(held: &Mutex<T>, f: impl FnOnce() -> R + Send) -> R {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::scope(|s| {
+            s.spawn(move || {
+                let _guard = held.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+            s.spawn(move || done_tx.send(f()).unwrap());
+            let answer = done_rx.recv_timeout(Duration::from_secs(10));
+            release_tx.send(()).unwrap();
+            answer.expect("the drain waited on a held lock")
+        })
+    }
+
+    /// A capturing drain hands the gestures over with their values, each at the chunk's frame
+    /// in the caller's block, and empties the log, so `take_parameter_edits` finds nothing.
+    /// Breaks by a capture that stamps offset 0, or leaves the log full.
+    #[test]
+    fn a_gesture_is_heard_with_its_value_at_the_chunks_frame() {
+        let handler = handler_with_a_gesture();
+        let (_, input, stash) = lists(Vec::new());
+        let mut heard = Vec::with_capacity(8);
+        assert!(capture(&handler, &input, &stash, &mut heard, 128));
+        assert_eq!(unsafe { input.getParameterCount() }, 1);
+        assert_eq!(heard, vec![(128, begin(7)), (128, value(7, 0.25))]);
+        assert!(handler.take_parameter_edits().is_empty());
+        assert_eq!(handler.edit_refusals(), 0);
+    }
+
+    /// A value the processor did not get this chunk keeps its gesture in the log, so no
+    /// gesture is ever placed before the block that heard its value. Breaks by capturing
+    /// whether or not the values were delivered.
+    #[test]
+    fn a_gesture_waits_while_its_value_waits() {
+        let handler = handler_with_a_gesture();
+        let (_, input, stash) = lists(Vec::new());
+        let mut heard = Vec::with_capacity(8);
+        let delivered = while_held(&stash, || capture(&handler, &input, &stash, &mut heard, 0));
+        assert!(!delivered);
+        assert_eq!(unsafe { input.getParameterCount() }, 0);
+        assert!(heard.is_empty(), "a gesture went ahead of its value");
+        assert_eq!(handler.edit_log().lock().unwrap().len(), 2);
+
+        assert!(capture(&handler, &input, &stash, &mut heard, 0));
+        assert_eq!(heard, vec![(0, begin(7)), (0, value(7, 0.25))]);
+    }
+
+    /// The audio thread never waits on the log: while `performEdit` holds it the values go
+    /// ahead and the gestures wait for the next chunk, which places them late, never early.
+    /// Breaks by taking the log with a blocking lock (the drain then waits past its deadline).
+    #[test]
+    fn a_held_log_is_left_for_the_next_chunk() {
+        let handler = handler_with_a_gesture();
+        let (_, input, stash) = lists(Vec::new());
+        let mut heard = Vec::with_capacity(8);
+        let delivered = while_held(handler.edit_log(), || {
+            capture(&handler, &input, &stash, &mut heard, 0)
+        });
+        assert!(delivered, "the values wait for nothing the log holds");
+        assert_eq!(unsafe { input.getParameterCount() }, 1);
+        assert!(heard.is_empty());
+
+        assert!(capture(&handler, &input, &stash, &mut heard, 64));
+        assert_eq!(heard, vec![(64, begin(7)), (64, value(7, 0.25))]);
+    }
+
+    /// The buffer never grows on the audio thread: a gesture past its reserve is dropped and
+    /// counted with the log's own refusals. Breaks by pushing past the capacity (the capacity
+    /// assertion), or by dropping without counting.
+    #[test]
+    fn a_gesture_past_the_buffer_is_dropped_and_counted() {
+        let handler = handler_with_a_gesture();
+        unsafe { handler.endEdit(7) };
+        let (_, input, stash) = lists(Vec::new());
+        let mut heard = Vec::with_capacity(1);
+        assert!(capture(&handler, &input, &stash, &mut heard, 0));
+        assert_eq!(heard, vec![(0, begin(7))]);
+        assert_eq!(heard.capacity(), 1);
+        assert_eq!(handler.edit_refusals(), 2);
+        assert!(handler.take_parameter_edits().is_empty());
     }
 }
