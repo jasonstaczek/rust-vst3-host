@@ -41,6 +41,10 @@ All notable changes to `vst3-host` are documented here. The format is based on
   collects.** It swaps each queue for a preallocated spare and collects after the lock is
   released, so a plugin calling `setDirty` or reporting progress from `process` waits at most
   for a pointer swap, and its push never reallocates.
+- **`PluginWindow::open` builds the editor's view once.** It used to create a throwaway view
+  to read the editor's size, then create the real one, each under the plugin lock. The window
+  now opens at a placeholder size and is fitted to the attached view, which halves how long an
+  open holds the lock.
 
 ### Added
 

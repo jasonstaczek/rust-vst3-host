@@ -27,6 +27,10 @@ use winapi::{
     },
 };
 
+/// The size, in pixels, a native editor window opens at before the attached editor reports its
+/// own, and keeps if the editor will not say.
+const EDITOR_PLACEHOLDER_SIZE: (i32, i32) = (800, 600);
+
 #[cfg(any(test, target_os = "windows"))]
 fn dpi_scale_factor(dpi: u32) -> Option<f32> {
     (dpi > 0).then_some(dpi as f32 / 96.0)
@@ -180,13 +184,11 @@ impl PluginWindow {
             .info()
             .clone();
 
-        // Try to get editor size
-        let (width, height) = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_editor_size()
-            .unwrap_or((800, 600));
+        // The native window opens at a placeholder size and is fitted to the editor once it is
+        // attached, from the attached view's own size. Asking for the size first would make the
+        // plugin build a second, throwaway view under the plugin lock, and the audio thread
+        // waits out every view build.
+        let (width, height) = EDITOR_PLACEHOLDER_SIZE;
 
         // Create native window
         #[cfg(target_os = "macos")]
@@ -243,13 +245,16 @@ impl PluginWindow {
                     Retained::as_ptr(&container_view) as *mut std::ffi::c_void
                 )
             };
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(window_handle)?;
+            let (width, height) = {
+                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
+                plugin.open_editor(window_handle)?;
+                plugin.get_editor_size().unwrap_or((width, height))
+            };
 
             // Match the window to the editor size, then show and center it.
-            window.setContentSize(container_frame.size);
+            let size = NSSize::new(width as f64, height as f64);
+            container_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
+            window.setContentSize(size);
             window.makeKeyAndOrderFront(None);
             window.center();
 
@@ -333,10 +338,14 @@ impl PluginWindow {
                 }
                 match plugin.open_editor(window_handle) {
                     Ok(()) => {
+                        let size = plugin.get_editor_size();
                         drop(plugin);
+                        self.native_window = Some(hwnd);
+                        if let Ok((width, height)) = size {
+                            self.resize_native_window(width, height);
+                        }
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
-                        self.native_window = Some(hwnd);
                     }
                     Err(e) => {
                         drop(plugin);
@@ -398,12 +407,16 @@ impl PluginWindow {
             let _ = connection.flush();
 
             let handle = crate::plugin::WindowHandle::from_x11(window.resource_id());
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(handle)?;
+            let size = {
+                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
+                plugin.open_editor(handle)?;
+                plugin.get_editor_size()
+            };
 
             self.native_window = Some(XcbWindowState { connection, window });
+            if let Ok((width, height)) = size {
+                self.resize_native_window(width, height);
+            }
         }
 
         #[cfg(target_os = "android")]
