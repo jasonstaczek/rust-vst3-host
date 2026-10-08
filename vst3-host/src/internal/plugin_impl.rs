@@ -1100,9 +1100,8 @@ impl PluginImpl {
         }
     }
 
-    /// Take the mark a control link's drain left when it passed a notification that
-    /// invalidates the unit cache, and act on it as [`Self::take_host_notifications`] would
-    /// have: forget the units and mark the program-change table stale.
+    /// Take the mark a drain of the host requests left when it passed one that invalidates the
+    /// unit cache: forget the units and mark the program-change table stale. Control thread.
     fn adopt_stale_units(&mut self) {
         if self.control.take_units_stale() {
             *self
@@ -3403,9 +3402,9 @@ impl PluginInternal for PluginImpl {
     }
 
     fn take_host_notifications(&mut self) -> Vec<crate::plugin::HostNotification> {
-        // The control link drains the same two queues, so either drain sees every request once.
+        // The control link drains the same two queues, so either drain sees every request once,
+        // and either leaves its unit-cache mark for `service_control_thread_caches`.
         let notifications = self.control.take_host_notifications();
-        self.adopt_stale_units();
         self.service_control_thread_caches();
         notifications
     }
