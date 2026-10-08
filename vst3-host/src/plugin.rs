@@ -846,6 +846,15 @@ pub(crate) trait PluginInternal: Send {
     fn reserve_sysex(&mut self, _messages: usize, _bytes: usize) -> Result<()> {
         Ok(())
     }
+    /// Bound the processor's output parameter pool. Defaults to doing nothing, for
+    /// implementations whose output path does not run in this process.
+    fn reserve_output_parameters(&mut self, _queues: usize, _points: usize) -> Result<()> {
+        Ok(())
+    }
+    /// Output parameter writes refused by the bounded pool. Defaults to 0.
+    fn output_parameter_refusals(&self) -> u64 {
+        0
+    }
     /// Queue a copy of a SysEx message. Defaults to an owned copy through
     /// [`Self::send_plugin_event`], which allocates.
     fn send_sysex_from_slice_at(&mut self, bytes: &[u8], sample_offset: i32) -> bool {
@@ -1769,6 +1778,34 @@ impl Plugin {
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
             .reserve_sysex(messages, bytes)
+    }
+
+    /// Preallocate the queues the processor writes `outputParameterChanges` into, `queues` of
+    /// them with `points` points each, and stop them growing.
+    ///
+    /// Without it the pool grows inside `process` the first time a plugin names more output
+    /// parameters in one block than any block before, or writes more points to one, which
+    /// allocates on the audio thread. After it, a parameter past `queues` in one block, or a
+    /// point past `points` on one parameter, is refused (`addParameterData` returns null,
+    /// `addPoint` `kResultFalse`) and counted in
+    /// [`output_parameter_refusals`](Self::output_parameter_refusals). It allocates, so call it
+    /// before the audio thread runs, for instance right after loading; a later call replaces
+    /// the pool. An isolated plugin reserves nothing.
+    pub fn reserve_output_parameters(&mut self, queues: usize, points: usize) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .reserve_output_parameters(queues, points)
+    }
+
+    /// How many output parameter writes the pool
+    /// [`reserve_output_parameters`](Self::reserve_output_parameters) made has refused since
+    /// the plugin loaded: one per parameter refused a queue, and one per point refused. It
+    /// reads an atomic, so the audio thread may call it after a block.
+    pub fn output_parameter_refusals(&self) -> u64 {
+        self.internal
+            .as_ref()
+            .map_or(0, |internal| internal.output_parameter_refusals())
     }
 
     /// Queue a copy of the SysEx message `bytes` at a sample offset within the next process

@@ -15,6 +15,10 @@ All notable changes to `vst3-host` are documented here. The format is based on
   `Plugin::reserve_sysex` reserves buffers before processing, and
   `Plugin::send_sysex_from_slice_at` copies a message into one; `process` hands each buffer
   back to the reserve instead of freeing it. `send_sysex` is unchanged and still allocates.
+- **A plugin's output parameters can be written with no allocation on the audio thread.**
+  `Plugin::reserve_output_parameters` preallocates the queues `outputParameterChanges` hands
+  out and stops them growing; a parameter or a point past them is refused and counted in
+  `Plugin::output_parameter_refusals`. Without the call the pool still grows in `process`.
 
 ### Added
 

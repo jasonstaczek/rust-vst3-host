@@ -2520,6 +2520,12 @@ pub struct ParameterChanges {
     /// Number of active queues this block (`<= queues.len()`). Mutated only under the `queues`
     /// lock, so the pair stays consistent.
     used: AtomicUsize,
+    /// Set by [`Self::reserve_bounded`]: the pool no longer grows, and a queue past it is
+    /// refused and counted in `refused` instead.
+    bounded: AtomicBool,
+    /// Plugin writes refused because the bounded pool or a bounded queue was full, shared with
+    /// each bounded queue: one per refused `addParameterData` and one per refused `addPoint`.
+    refused: Arc<AtomicU64>,
 }
 
 impl Default for ParameterChanges {
@@ -2527,6 +2533,8 @@ impl Default for ParameterChanges {
         Self {
             queues: Mutex::new(Vec::new()),
             used: AtomicUsize::new(0),
+            bounded: AtomicBool::new(false),
+            refused: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -2563,6 +2571,33 @@ impl ParameterChanges {
     /// cleared when a slot is recycled), so this allocates and drops nothing.
     pub fn clear_all(&self) {
         self.used.store(0, Ordering::Relaxed);
+    }
+
+    /// Replace the pool with `queues` queues of `points` points each, all allocated here, and
+    /// stop it growing: from now on a plugin's `addParameterData` past the pool, or `addPoint`
+    /// past a queue's points, is refused and counted (see [`Self::refused`]) rather than
+    /// allocating. It allocates and frees, so call it off the audio thread, between blocks.
+    /// Each queue's lock is taken once here, so its first lock in a block makes nothing.
+    pub fn reserve_bounded(&self, queues: usize, points: usize) {
+        let pool: Vec<_> = (0..queues)
+            .map(|_| {
+                let q = ParameterValueQueue::bounded(points, Arc::clone(&self.refused));
+                drop(q.points.lock());
+                ComWrapper::new(q)
+            })
+            .collect();
+        let mut guard = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        let old = std::mem::replace(&mut *guard, pool);
+        self.used.store(0, Ordering::Relaxed);
+        self.bounded.store(true, Ordering::Relaxed);
+        drop(guard);
+        drop(old);
+    }
+
+    /// Plugin writes refused since this was made, because the pool [`Self::reserve_bounded`]
+    /// made, or one of its queues, was full.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// Visit every point the plugin wrote into the active queues for this block.
@@ -2677,8 +2712,13 @@ impl IParameterChangesTrait for ParameterChanges {
                     }
                 }
 
-                // Activate a slot: recycle a pooled queue if one exists, else grow once.
+                // Activate a slot: recycle a pooled queue if one exists, else grow once, unless
+                // the pool is bounded, which refuses the parameter rather than allocating.
                 if used == queues.len() {
+                    if self.bounded.load(Ordering::Relaxed) {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return ptr::null_mut();
+                    }
                     queues.push(ComWrapper::new(ParameterValueQueue::new(param_id)));
                 } else {
                     queues[used].reset(param_id);
@@ -2721,6 +2761,8 @@ pub struct ParameterValueQueue {
     // dropping and reallocating the ComWrapper each block.
     pub param_id: AtomicU32,
     pub points: Mutex<Vec<(i32, f64)>>, // sample offset, value
+    /// A bounded queue's point capacity and the counter its refusals go to; `None` grows.
+    bound: Option<(usize, Arc<AtomicU64>)>,
 }
 
 impl ParameterValueQueue {
@@ -2728,6 +2770,17 @@ impl ParameterValueQueue {
         Self {
             param_id: AtomicU32::new(param_id),
             points: Mutex::new(Vec::new()),
+            bound: None,
+        }
+    }
+
+    /// A queue holding at most `points` points, all allocated here; `addPoint` past them is
+    /// refused and counted in `refused`.
+    fn bounded(points: usize, refused: Arc<AtomicU64>) -> Self {
+        Self {
+            param_id: AtomicU32::new(0),
+            points: Mutex::new(Vec::with_capacity(points)),
+            bound: Some((points, refused)),
         }
     }
 
@@ -2795,6 +2848,12 @@ impl IParamValueQueueTrait for ParameterValueQueue {
 
     unsafe fn addPoint(&self, sample_offset: i32, value: f64, index: *mut i32) -> i32 {
         let mut points = self.points.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((capacity, refused)) = &self.bound {
+            if points.len() >= *capacity {
+                refused.fetch_add(1, Ordering::Relaxed);
+                return kResultFalse;
+            }
+        }
 
         // Find insertion point
         let insert_pos = points
@@ -3941,6 +4000,39 @@ mod parameter_changes_tests {
             pool_len_after_block_1,
             "clearing between blocks must reuse pooled queues rather than growing the pool"
         );
+    }
+
+    /// A bounded pool hands out only the queues and points it was given, refuses a parameter or
+    /// a point past them and counts each refusal, and never grows.
+    #[test]
+    fn a_bounded_output_pool_refuses_and_counts_rather_than_growing() {
+        let pc = ParameterChanges::default();
+        pc.reserve_bounded(2, 2);
+        let add = |id: u32| unsafe { pc.addParameterData(&id, ptr::null_mut()) };
+        let point = |q: *mut IParamValueQueue, offset: i32| unsafe {
+            ComRef::from_raw(q)
+                .unwrap()
+                .addPoint(offset, 0.5, ptr::null_mut())
+        };
+        for _ in 0..2 {
+            let (a, b) = (add(1), add(2));
+            assert!(!a.is_null() && !b.is_null());
+            assert_eq!(add(1), a, "a parameter named twice keeps its queue");
+            assert!(add(3).is_null(), "a third parameter is past the pool");
+            assert_eq!(point(a, 0), kResultOk);
+            assert_eq!(point(a, 1), kResultOk);
+            assert_eq!(point(a, 2), kResultFalse, "a third point is past the queue");
+            assert_eq!(unsafe { pc.getParameterCount() }, 2);
+            pc.clear_all();
+        }
+        assert_eq!(pc.refused(), 4);
+        assert_eq!(pc.queues.lock().unwrap().len(), 2, "the pool never grew");
+        assert!(pc
+            .queues
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|q| q.points.lock().unwrap().capacity() == 2));
     }
 
     #[test]

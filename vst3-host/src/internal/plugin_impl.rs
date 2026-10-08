@@ -216,6 +216,10 @@ pub struct PluginImpl {
     // Processor-originated output parameter points. Bounded and lock-free: process() pushes,
     // the host/UI drains through get_parameter_changes().
     output_param_feedback: Arc<ArrayQueue<(u32, f64)>>,
+    // The processor's `outputParameterChanges`. Held here rather than in the process data, which
+    // is rebuilt on a reconfigure, so a pool `reserve_output_parameters` made, and its refusal
+    // count, outlive a reconfigure.
+    output_param_changes: ComWrapper<ParameterChanges>,
     // Parameter values that reached the processor queue from a thread that must not call
     // `IEditController` (the audio callback, via the playback handles). Bounded, lock-free and
     // drop-oldest; the control-thread service paths drain it into setParamNormalized so the
@@ -275,7 +279,6 @@ struct HostProcessData {
     process_context_requirements: Option<u32>,
     transport_tempo: f64,
     input_param_changes: ComWrapper<ParameterChanges>,
-    output_param_changes: ComWrapper<ParameterChanges>,
     // Preallocated channel-pointer arrays, built once in prepare_buffers. The audio buffers'
     // addresses are stable after allocation, so process() reuses these instead of rebuilding
     // them every block — keeping the steady-state audio path allocation-free.
@@ -1514,6 +1517,7 @@ impl PluginImpl {
                     MAX_EDITOR_FEEDBACK,
                 ))),
                 output_param_feedback: Arc::new(ArrayQueue::new(MAX_OUTPUT_PARAMETER_FEEDBACK)),
+                output_param_changes: ComWrapper::new(ParameterChanges::default()),
                 deferred_controller_sync: ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC),
                 input_events,
                 output_events,
@@ -1863,7 +1867,6 @@ impl PluginImpl {
                 process_context_requirements: self.process_context_requirements,
                 transport_tempo: self.tempo,
                 input_param_changes: ComWrapper::new(ParameterChanges::default()),
-                output_param_changes: ComWrapper::new(ParameterChanges::default()),
             });
 
             // Initialize process context
@@ -1915,7 +1918,7 @@ impl PluginImpl {
                 .as_com_ref::<IParameterChanges>()
                 .map(|ptr| ptr.as_ptr())
                 .unwrap_or(ptr::null_mut());
-            data.process_data.outputParameterChanges = data
+            data.process_data.outputParameterChanges = self
                 .output_param_changes
                 .as_com_ref::<IParameterChanges>()
                 .map(|ptr| ptr.as_ptr())
@@ -2089,7 +2092,7 @@ impl PluginImpl {
                 // Without this, addParameterData()/addPoint() would keep appending to queues
                 // from prior blocks, mixing stale points into new ones, growing point storage
                 // unbounded, and risking a reallocation on the audio thread long after warm-up.
-                data.output_param_changes.clear_all();
+                self.output_param_changes.clear_all();
 
                 // VST3 allows numSamples to vary up to the maximum given to setupProcessing; the
                 // caller's block may be shorter (BufferSize::Default gives variable sizes) or, if
@@ -2190,11 +2193,11 @@ impl PluginImpl {
                 // bounded lock-free feedback queue, then clear it on both success and failure
                 // so stale points can never be re-reported.
                 let feedback = &self.output_param_feedback;
-                data.output_param_changes
+                self.output_param_changes
                     .for_each_active_point(|id, _offset, value| {
                         feedback.force_push((id, value));
                     });
-                data.output_param_changes.clear_all();
+                self.output_param_changes.clear_all();
 
                 // Capture any MIDI the plugin emitted this block (arpeggiators, MPE, etc.).
                 // Drain the event list in place (no `mem::take`) and push each converted event
@@ -2882,6 +2885,15 @@ impl PluginInternal for PluginImpl {
     fn reserve_sysex(&mut self, messages: usize, bytes: usize) -> Result<()> {
         self.input_events.reserve_payloads(messages, bytes);
         Ok(())
+    }
+
+    fn reserve_output_parameters(&mut self, queues: usize, points: usize) -> Result<()> {
+        self.output_param_changes.reserve_bounded(queues, points);
+        Ok(())
+    }
+
+    fn output_parameter_refusals(&self) -> u64 {
+        self.output_param_changes.refused()
     }
 
     fn send_sysex_from_slice_at(&mut self, bytes: &[u8], sample_offset: i32) -> bool {
