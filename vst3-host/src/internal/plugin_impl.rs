@@ -5798,9 +5798,9 @@ mod editor_edit_drain_tests {
         }
     }
 
-    /// A link applies nothing anywhere but the control thread, where an `IEditController`
-    /// call does not belong, and nothing once the plugin dropped the controller; either way
-    /// the values stay parked. Breaks by dropping the thread check (the spawned call pops).
+    /// A link with no controller, as the plugin's drop leaves it, applies nothing on any
+    /// thread and keeps the parked values. Breaks by a service that takes values it cannot
+    /// apply. The thread check needs a live controller, so a host pins it against a plugin.
     #[test]
     fn a_link_applies_nothing_off_the_control_thread_or_after_the_plugin() {
         let shared = control(None);
