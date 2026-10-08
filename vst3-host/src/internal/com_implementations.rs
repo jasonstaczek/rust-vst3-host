@@ -18,8 +18,9 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface, Steinberg::Vst::*, Stei
 // Providing a real host-application object that at least answers `getName` lets them
 // initialize. `createInstance` below also vends the host-created objects they ask for
 // (IMessage/IAttributeList), used to pass data between a plugin's component and controller.
-struct ProgressState {
-    notifications: Vec<crate::plugin::HostNotification>,
+pub(crate) struct ProgressState {
+    /// Queued `IProgress` requests, oldest first, never past `MAX_HOST_NOTIFICATIONS`.
+    pub(crate) notifications: Vec<crate::plugin::HostNotification>,
     active: HashSet<u64>,
     next_id: u64,
 }
@@ -55,21 +56,28 @@ impl Default for HostApplication {
 pub(crate) struct ProgressQueue(Arc<Mutex<ProgressState>>);
 
 impl ProgressQueue {
-    /// Drain the queued `IProgress` requests, oldest first.
-    // Drained in place rather than `mem::take`, which would leave the plugin's next push to
-    // reallocate on its callback path.
-    #[allow(clippy::drain_collect)]
-    pub(crate) fn take(&self) -> Vec<crate::plugin::HostNotification> {
-        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        state.notifications.drain(..).collect()
+    /// The progress state behind the lock the plugin takes to push a request.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ProgressState> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether a push would find the lock free now.
+    #[cfg(test)]
+    pub(crate) fn is_free(&self) -> bool {
+        self.0.try_lock().is_ok()
     }
 }
 
 impl HostApplication {
     // The plugin drains through the control link's copy of the queue; tests drain here.
     #[cfg(test)]
+    #[allow(clippy::drain_collect)]
     pub fn take_progress_notifications(&self) -> Vec<crate::plugin::HostNotification> {
-        self.progress_queue().take()
+        self.progress_queue()
+            .lock()
+            .notifications
+            .drain(..)
+            .collect()
     }
 
     /// The `IProgress` request queue, shared.

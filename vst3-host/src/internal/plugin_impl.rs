@@ -31,7 +31,7 @@ use super::{
         create_memory_stream_from_with_metadata, create_memory_stream_with_metadata,
         create_state_restore_stream, ComponentHandler, ConnectionPair, HostApplication,
         HostEventList, HostPlugFrame, ParameterChanges, ProgressQueue, StreamStateType,
-        MAX_EDITOR_FEEDBACK, MAX_QUEUED_EVENTS,
+        MAX_EDITOR_FEEDBACK, MAX_HOST_NOTIFICATIONS, MAX_QUEUED_EVENTS,
     },
     module_loader::{load_module, VstModule},
 };
@@ -1504,6 +1504,7 @@ impl PluginImpl {
                 dirty: component_handler.dirty_flag(),
                 notifications: component_handler.notification_queue(),
                 progress: host_app.progress_queue(),
+                spare: Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS)),
                 units_stale: AtomicBool::new(false),
                 control_thread: thread::current().id(),
             });
@@ -4619,6 +4620,9 @@ pub(crate) struct ControlShared {
     // which the plugin takes to push and the audio thread never takes.
     notifications: Arc<Mutex<Vec<crate::plugin::HostNotification>>>,
     progress: ProgressQueue,
+    // What a drain swaps into a queue, empty between drains and as large as the queue's cap,
+    // so the plugin's next push into the queue it swapped in never reallocates.
+    spare: Mutex<Vec<crate::plugin::HostNotification>>,
     // Raised by a drain that passed a request invalidating the unit cache; the `Plugin` takes
     // it at its next control-thread entry, since only it holds the caches.
     units_stale: AtomicBool,
@@ -4655,15 +4659,34 @@ impl ControlShared {
 
     /// Drain the handler's requests, then the `IProgress` ones, on any thread, and mark the
     /// unit cache stale when one of them invalidates it. Takes neither the `Plugin` nor a lock
-    /// the audio thread takes.
+    /// the audio thread takes, and holds a lock a plugin pushes under only to swap the queue
+    /// for the spare.
     pub(crate) fn take_host_notifications(&self) -> Vec<crate::plugin::HostNotification> {
-        let mut taken: Vec<_> = self
-            .notifications
+        self.take_host_notifications_probed(|| {})
+    }
+
+    // `collecting` runs after each swap, just before that queue is collected: a test seam.
+    fn take_host_notifications_probed(
+        &self,
+        mut collecting: impl FnMut(),
+    ) -> Vec<crate::plugin::HostNotification> {
+        // Only drains take the spare's lock, so a plugin never waits on it.
+        let mut spare = self
+            .spare
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .drain(..)
-            .collect();
-        taken.extend(self.progress.take());
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::mem::swap(
+            &mut *self
+                .notifications
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            &mut *spare,
+        );
+        collecting();
+        let mut taken: Vec<_> = spare.drain(..).collect();
+        std::mem::swap(&mut self.progress.lock().notifications, &mut *spare);
+        collecting();
+        taken.extend(spare.drain(..));
         if taken
             .iter()
             .any(crate::plugin::HostNotification::invalidates_unit_cache)
@@ -5844,6 +5867,7 @@ mod editor_edit_drain_tests {
             dirty: Arc::new(AtomicBool::new(false)),
             notifications: Arc::new(Mutex::new(Vec::new())),
             progress: create_host_application().progress_queue(),
+            spare: Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS)),
             units_stale: AtomicBool::new(false),
             control_thread: thread::current().id(),
         }
@@ -5878,7 +5902,6 @@ mod editor_edit_drain_tests {
     /// queue full or forgets the mark.
     #[test]
     fn a_links_drain_frees_both_queues_and_marks_the_units_stale_once() {
-        use crate::internal::com_implementations::MAX_HOST_NOTIFICATIONS;
         use crate::plugin::HostNotification;
 
         let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
@@ -5920,6 +5943,65 @@ mod editor_edit_drain_tests {
         assert!(shared.units_stale());
         assert!(shared.take_units_stale());
         assert!(!shared.take_units_stale(), "the mark is taken once");
+    }
+
+    /// A link's drain holds each queue's lock only to swap the queue for its spare, so a
+    /// plugin pushing from `process` while the drain collects finds the lock free, and its
+    /// push lands in a queue as large as the cap and is drained next time. Breaks by a drain
+    /// that collects either queue under its lock, that never swaps, or whose spare is not
+    /// preallocated (the plugin's next push would reallocate).
+    #[test]
+    fn a_links_drain_collects_with_neither_queue_locked() {
+        use crate::plugin::HostNotification;
+
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let host = create_host_application();
+        let shared = ControlShared {
+            notifications: handler.notification_queue(),
+            progress: host.progress_queue(),
+            ..control(None)
+        };
+        let progress = host.to_com_ptr::<IProgress>().unwrap();
+        let mut id = 0;
+        unsafe {
+            assert_eq!(handler.setDirty(1), kResultOk);
+            assert_eq!(
+                progress.start(
+                    IProgress_::ProgressType_::UIBackgroundTask,
+                    ptr::null(),
+                    &mut id
+                ),
+                kResultOk
+            );
+        }
+        let (mut collects, mut waits) = (0, 0);
+        let taken = shared.take_host_notifications_probed(|| {
+            collects += 1;
+            let free = shared.notifications.try_lock().is_ok() && shared.progress.is_free();
+            if !free {
+                waits += 1;
+                return;
+            }
+            // The push a plugin's `process` makes while the drain collects.
+            unsafe { assert_eq!(handler.setDirty(0), kResultOk) };
+        });
+        assert_eq!((collects, waits), (2, 0), "a push met a held queue lock");
+        assert!(matches!(
+            taken.as_slice(),
+            [
+                HostNotification::DirtyChanged(true),
+                HostNotification::ProgressStarted { .. }
+            ]
+        ));
+        assert!(shared.notifications.lock().unwrap().capacity() >= MAX_HOST_NOTIFICATIONS);
+        assert!(shared.progress.lock().notifications.capacity() >= MAX_HOST_NOTIFICATIONS);
+        assert!(matches!(
+            shared.take_host_notifications().as_slice(),
+            [
+                HostNotification::DirtyChanged(false),
+                HostNotification::DirtyChanged(false)
+            ]
+        ));
     }
 
     type Heard = Vec<(i32, ParameterEdit)>;

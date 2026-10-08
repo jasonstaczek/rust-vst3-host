@@ -37,6 +37,10 @@ All notable changes to `vst3-host` are documented here. The format is based on
   `Plugin`, so a host whose audio thread holds it can keep the queue from filling and refusing
   the plugin's `setDirty`. A program-list or unit change it drains is acted on at the `Plugin`'s
   next control-thread call.
+- **A drain of the host requests no longer holds a lock a plugin pushes under while it
+  collects.** It swaps each queue for a preallocated spare and collects after the lock is
+  released, so a plugin calling `setDirty` or reporting progress from `process` waits at most
+  for a pointer swap, and its push never reallocates.
 
 ### Added
 
