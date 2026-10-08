@@ -32,6 +32,11 @@ All notable changes to `vst3-host` are documented here. The format is based on
   when the notification queue is full. A host whose audio thread holds the `Plugin` no longer
   has to take it for either. The plugin's drop takes the controller out of the link first, so
   a link that outlives it does nothing.
+- **A control link drains the plugin's host requests.** `ControlLink::take_host_notifications`
+  drains what `Plugin::take_host_notifications` drains, from the same queues, without the
+  `Plugin`, so a host whose audio thread holds it can keep the queue from filling and refusing
+  the plugin's `setDirty`. A program-list or unit change it drains is acted on at the `Plugin`'s
+  next control-thread call.
 
 ### Added
 

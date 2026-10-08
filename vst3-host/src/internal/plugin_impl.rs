@@ -30,8 +30,8 @@ use super::{
         create_event_list, create_host_application, create_host_plug_frame,
         create_memory_stream_from_with_metadata, create_memory_stream_with_metadata,
         create_state_restore_stream, ComponentHandler, ConnectionPair, HostApplication,
-        HostEventList, HostPlugFrame, ParameterChanges, StreamStateType, MAX_EDITOR_FEEDBACK,
-        MAX_QUEUED_EVENTS,
+        HostEventList, HostPlugFrame, ParameterChanges, ProgressQueue, StreamStateType,
+        MAX_EDITOR_FEEDBACK, MAX_QUEUED_EVENTS,
     },
     module_loader::{load_module, VstModule},
 };
@@ -1090,12 +1090,29 @@ impl PluginImpl {
         if thread::current().id() != self.control_thread {
             return;
         }
+        self.adopt_stale_units();
         self.drain_deferred_controller_sync();
         if std::mem::take(&mut self.dirty_caches.midi_mapping) {
             self.refresh_midi_mapping_cache();
         }
         if std::mem::take(&mut self.dirty_caches.program_change) {
             self.refresh_program_change_cache();
+        }
+    }
+
+    /// Take the mark a control link's drain left when it passed a notification that
+    /// invalidates the unit cache, and act on it as [`Self::take_host_notifications`] would
+    /// have: forget the units and mark the program-change table stale.
+    fn adopt_stale_units(&mut self) {
+        if self.control.take_units_stale() {
+            *self
+                .unit_cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            // Mark the program-change table stale rather than clearing it: an emptied table
+            // silently turns every MIDI ProgramChange into a no-op until something else happens
+            // to rebuild it, whereas a stale table still routes to the previous parameter.
+            self.dirty_caches.program_change = true;
         }
     }
 
@@ -1486,6 +1503,9 @@ impl PluginImpl {
                 controller: Mutex::new(controller.clone()),
                 deferred: Arc::clone(&deferred_controller_sync),
                 dirty: component_handler.dirty_flag(),
+                notifications: component_handler.notification_queue(),
+                progress: host_app.progress_queue(),
+                units_stale: AtomicBool::new(false),
                 control_thread: thread::current().id(),
             });
 
@@ -3383,25 +3403,9 @@ impl PluginInternal for PluginImpl {
     }
 
     fn take_host_notifications(&mut self) -> Vec<crate::plugin::HostNotification> {
-        let mut notifications = self
-            .component_handler
-            .as_ref()
-            .map(|handler| handler.take_host_notifications())
-            .unwrap_or_default();
-        notifications.extend(self._host_app.take_progress_notifications());
-        if notifications
-            .iter()
-            .any(crate::plugin::HostNotification::invalidates_unit_cache)
-        {
-            *self
-                .unit_cache
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = None;
-            // Mark the program-change table stale rather than clearing it: an emptied table
-            // silently turns every MIDI ProgramChange into a no-op until something else happens
-            // to rebuild it, whereas a stale table still routes to the previous parameter.
-            self.dirty_caches.program_change = true;
-        }
+        // The control link drains the same two queues, so either drain sees every request once.
+        let notifications = self.control.take_host_notifications();
+        self.adopt_stale_units();
         self.service_control_thread_caches();
         notifications
     }
@@ -3692,6 +3696,14 @@ impl PluginInternal for PluginImpl {
             return Err(Error::Other(
                 "unit metadata must be queried on the plugin control thread".to_string(),
             ));
+        }
+        // A control link's drain may have passed a notification that invalidates the cache;
+        // the mark itself stays for `adopt_stale_units`, which also owes the program-change table.
+        if self.control.units_stale() {
+            *self
+                .unit_cache
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
         }
         if let Some(units) = self
             .unit_cache
@@ -4596,7 +4608,7 @@ fn set_controller_parameter(controller: &ComPtr<IEditController>, id: u32, value
 
 /// The part of a loaded plugin a control thread reaches through [`crate::plugin::ControlLink`]
 /// while another thread holds the `Plugin`: the controller, the values the audio thread parked
-/// for it, and the dirty flag.
+/// for it, the dirty flag, and the host-request queues.
 pub(crate) struct ControlShared {
     // `PluginImpl::drop` takes it out before the teardown, so a link that outlives the plugin
     // never calls a terminated controller, nor releases it after the module is unloaded. Only
@@ -4604,6 +4616,13 @@ pub(crate) struct ControlShared {
     controller: Mutex<Option<ComPtr<IEditController>>>,
     deferred: Arc<ArrayQueue<(u32, f64)>>,
     dirty: Arc<AtomicBool>,
+    // The handler's and the host application's request queues, each behind its own lock,
+    // which the plugin takes to push and the audio thread never takes.
+    notifications: Arc<Mutex<Vec<crate::plugin::HostNotification>>>,
+    progress: ProgressQueue,
+    // Raised by a drain that passed a request invalidating the unit cache; the `Plugin` takes
+    // it at its next control-thread entry, since only it holds the caches.
+    units_stale: AtomicBool,
     control_thread: ThreadId,
 }
 
@@ -4633,6 +4652,36 @@ impl ControlShared {
     /// Whether `setDirty(true)` was called since the last take; clears it.
     pub(crate) fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Drain the handler's requests, then the `IProgress` ones, on any thread, and mark the
+    /// unit cache stale when one of them invalidates it. Takes neither the `Plugin` nor a lock
+    /// the audio thread takes.
+    pub(crate) fn take_host_notifications(&self) -> Vec<crate::plugin::HostNotification> {
+        let mut taken: Vec<_> = self
+            .notifications
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .drain(..)
+            .collect();
+        taken.extend(self.progress.take());
+        if taken
+            .iter()
+            .any(crate::plugin::HostNotification::invalidates_unit_cache)
+        {
+            self.units_stale.store(true, Ordering::Release);
+        }
+        taken
+    }
+
+    /// Whether a drain left the unit cache stale since the `Plugin` last took the mark.
+    pub(crate) fn units_stale(&self) -> bool {
+        self.units_stale.load(Ordering::Acquire)
+    }
+
+    /// Takes the mark [`Self::units_stale`] reads.
+    pub(crate) fn take_units_stale(&self) -> bool {
+        self.units_stale.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -5794,6 +5843,9 @@ mod editor_edit_drain_tests {
             controller: Mutex::new(controller),
             deferred: Arc::new(ArrayQueue::new(4)),
             dirty: Arc::new(AtomicBool::new(false)),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            progress: create_host_application().progress_queue(),
+            units_stale: AtomicBool::new(false),
             control_thread: thread::current().id(),
         }
     }
@@ -5819,6 +5871,56 @@ mod editor_edit_drain_tests {
         shared.dirty.store(true, Ordering::Release);
         assert!(shared.take_dirty());
         assert!(!shared.take_dirty());
+    }
+
+    /// A link's drain takes the handler's requests and the `IProgress` ones, in that order,
+    /// so a plugin the full queue refused is heard again, and a request that invalidates the
+    /// unit cache leaves the mark for the `Plugin`, once. Breaks by a drain that leaves either
+    /// queue full or forgets the mark.
+    #[test]
+    fn a_links_drain_frees_both_queues_and_marks_the_units_stale_once() {
+        use crate::internal::com_implementations::MAX_HOST_NOTIFICATIONS;
+        use crate::plugin::HostNotification;
+
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let host = create_host_application();
+        let shared = ControlShared {
+            notifications: handler.notification_queue(),
+            progress: host.progress_queue(),
+            ..control(None)
+        };
+        let progress = host.to_com_ptr::<IProgress>().unwrap();
+        let mut id = 0;
+        unsafe {
+            for _ in 0..MAX_HOST_NOTIFICATIONS {
+                assert_eq!(handler.setDirty(1), kResultOk);
+            }
+            assert_eq!(handler.setDirty(1), kResultFalse, "the queue is full");
+            assert_eq!(
+                progress.start(
+                    IProgress_::ProgressType_::UIBackgroundTask,
+                    ptr::null(),
+                    &mut id
+                ),
+                kResultOk
+            );
+        }
+        let taken = shared.take_host_notifications();
+        assert_eq!(taken.len(), MAX_HOST_NOTIFICATIONS + 1);
+        assert!(matches!(
+            taken.last(),
+            Some(HostNotification::ProgressStarted { .. })
+        ));
+        assert!(!shared.units_stale(), "no request invalidated the units");
+
+        unsafe {
+            assert_eq!(handler.setDirty(1), kResultOk, "the drained queue takes it");
+            assert_eq!(handler.notifyProgramListChange(1, -1), kResultOk);
+        }
+        assert_eq!(shared.take_host_notifications().len(), 2);
+        assert!(shared.units_stale());
+        assert!(shared.take_units_stale());
+        assert!(!shared.take_units_stale(), "the mark is taken once");
     }
 
     type Heard = Vec<(i32, ParameterEdit)>;

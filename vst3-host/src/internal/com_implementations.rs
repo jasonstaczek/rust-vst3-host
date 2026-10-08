@@ -35,26 +35,46 @@ impl Default for ProgressState {
 }
 
 pub struct HostApplication {
-    progress: Mutex<ProgressState>,
+    // Shared with the control link (`Plugin::control_link`), which drains it without the
+    // `Plugin`.
+    progress: Arc<Mutex<ProgressState>>,
     data_exchange: Arc<super::data_exchange::DataExchangeState>,
 }
 
 impl Default for HostApplication {
     fn default() -> Self {
         Self {
-            progress: Mutex::new(ProgressState::default()),
+            progress: Arc::new(Mutex::new(ProgressState::default())),
             data_exchange: super::data_exchange::DataExchangeState::new(),
         }
     }
 }
 
-impl HostApplication {
-    pub fn take_progress_notifications(&self) -> Vec<crate::plugin::HostNotification> {
-        let mut state = self
-            .progress
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+/// The `IProgress` request queue, shared, for a drain that does not hold the `Plugin`.
+#[derive(Clone)]
+pub(crate) struct ProgressQueue(Arc<Mutex<ProgressState>>);
+
+impl ProgressQueue {
+    /// Drain the queued `IProgress` requests, oldest first.
+    // Drained in place rather than `mem::take`, which would leave the plugin's next push to
+    // reallocate on its callback path.
+    #[allow(clippy::drain_collect)]
+    pub(crate) fn take(&self) -> Vec<crate::plugin::HostNotification> {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         state.notifications.drain(..).collect()
+    }
+}
+
+impl HostApplication {
+    // The plugin drains through the control link's copy of the queue; tests drain here.
+    #[cfg(test)]
+    pub fn take_progress_notifications(&self) -> Vec<crate::plugin::HostNotification> {
+        self.progress_queue().take()
+    }
+
+    /// The `IProgress` request queue, shared.
+    pub(crate) fn progress_queue(&self) -> ProgressQueue {
+        ProgressQueue(Arc::clone(&self.progress))
     }
 
     pub fn configure_data_exchange(
@@ -1682,7 +1702,7 @@ impl ComponentHandler {
     /// Drain the ordered parameter-edit gesture log accumulated since the last call.
     ///
     /// Ordered relative to other parameter edits only. The `startGroupEdit`/`finishGroupEdit`
-    /// brackets live in the separate [`Self::take_host_notifications`] stream with no recorded
+    /// brackets live in the separate `take_host_notifications` stream with no recorded
     /// interleaving, so the edits that a group covered cannot be identified — see the type
     /// comment on [`ComponentHandler`].
     ///
@@ -1709,6 +1729,8 @@ impl ComponentHandler {
     /// past the cap returns `kResultFalse` to the plugin, so a host that never drains starts
     /// making the plugin's own `setDirty` / `requestOpenEditor` / group-edit /
     /// progress-reporting calls fail.
+    // The plugin drains through the control link's copy of the queue; tests drain here.
+    #[cfg(test)]
     pub fn take_host_notifications(&self) -> Vec<crate::plugin::HostNotification> {
         let mut notifications = self
             .notifications
@@ -1754,6 +1776,11 @@ impl ComponentHandler {
     /// The flag every `setDirty(true)` raises, shared.
     pub(crate) fn dirty_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.dirty_raised)
+    }
+
+    /// The request queue, shared with the control link, which drains it for the `Plugin`.
+    pub(crate) fn notification_queue(&self) -> Arc<Mutex<Vec<crate::plugin::HostNotification>>> {
+        Arc::clone(&self.notifications)
     }
 
     fn push_notification(&self, notification: crate::plugin::HostNotification) -> bool {

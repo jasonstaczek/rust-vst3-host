@@ -364,8 +364,10 @@ pub enum ParameterEditKind {
 /// applies to the edit controller the values `process` was handed off the control thread,
 /// which the `Plugin`'s own control-thread calls otherwise apply; call it on the thread that
 /// loaded the plugin, each UI frame, so the plugin's editor follows automation.
-/// [`take_dirty`](Self::take_dirty) reports `setDirty(true)`. The link may outlive the plugin:
-/// after the plugin is dropped `service` does nothing.
+/// [`take_dirty`](Self::take_dirty) reports `setDirty(true)`, and
+/// [`take_host_notifications`](Self::take_host_notifications) drains the plugin's requests so
+/// their queue never fills and refuses them. The link may outlive the plugin: after the plugin
+/// is dropped `service` does nothing.
 #[derive(Clone)]
 pub struct ControlLink {
     shared: std::sync::Arc<crate::internal::plugin_impl::ControlShared>,
@@ -388,6 +390,15 @@ impl ControlLink {
     /// [`Plugin::take_host_notifications`] drains is full and refuses the call.
     pub fn take_dirty(&self) -> bool {
         self.shared.take_dirty()
+    }
+
+    /// Drain the requests [`Plugin::take_host_notifications`] drains, from the same queues, on
+    /// any thread, without the `Plugin`; each request is drained by one or the other. A request
+    /// that invalidates the unit cache is acted on at the `Plugin`'s next control-thread call,
+    /// a [`Plugin::take_host_notifications`] among them, since only the `Plugin` holds the
+    /// cache. Never takes a lock the audio thread takes. Allocates the returned `Vec`.
+    pub fn take_host_notifications(&self) -> Vec<HostNotification> {
+        self.shared.take_host_notifications()
     }
 }
 
