@@ -511,6 +511,13 @@ fn test_midi_program_change_moves_the_program() {
     let count = root.programs.len() as i32;
     assert!(count >= 3, "expected at least three factory programs");
 
+    assert_eq!(
+        plugin.program_change_parameter(0),
+        Some((program_param.id, count)),
+        "the root unit resolves to the parameter a ProgramChange drives"
+    );
+    assert_eq!(plugin.program_change_parameter(9999), None);
+
     let normalized_for = |index: i32| (index as f64) / ((count - 1) as f64);
 
     for index in [count - 1, 1, 0] {

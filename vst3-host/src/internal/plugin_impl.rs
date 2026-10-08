@@ -3501,6 +3501,11 @@ impl PluginInternal for PluginImpl {
         self.midi_mapping_cache.get(bus, channel, cc)
     }
 
+    fn program_change_parameter(&self, unit_id: i32) -> Option<(u32, i32)> {
+        self.cached_program_change(unit_id)
+            .map(|mapping| (mapping.param_id, mapping.program_count))
+    }
+
     fn note_on(
         &mut self,
         channel: MidiChannel,

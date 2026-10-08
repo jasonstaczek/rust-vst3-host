@@ -1071,6 +1071,10 @@ pub(crate) trait PluginInternal: Send {
     fn midi_cc_to_parameter(&self, _bus: i32, _channel: i16, _cc: u16) -> Option<u32> {
         None
     }
+    /// Resolve a unit to its program-change parameter and program count. Defaults to `None`.
+    fn program_change_parameter(&self, _unit_id: i32) -> Option<(u32, i32)> {
+        None
+    }
     /// Serialize the plugin's current state to an opaque byte blob.
     fn save_state(&self) -> Result<Vec<u8>> {
         Err(Error::Other(
@@ -1602,6 +1606,19 @@ impl Plugin {
         self.internal
             .as_ref()?
             .midi_cc_to_parameter(bus, channel, cc)
+    }
+
+    /// Resolve a unit to the parameter that selects its program, and how many programs its list
+    /// holds, from the table `IUnitInfo` filled at load and after a restart.
+    ///
+    /// Program `n` of a count-`c` list is the parameter at `n / (c - 1)`, `0` for a one-program
+    /// list; that is the point a `MidiEvent::ProgramChange` queues, on unit `0`, and that
+    /// [`select_program`](Self::select_program) sets. Returns `None` for a unit with no
+    /// program list, a plugin without `IUnitInfo`, or a plugin under process isolation. It reads
+    /// the table and neither allocates nor calls the plugin, so the audio thread may use it to
+    /// queue a program change through [`set_parameter_at`](Self::set_parameter_at).
+    pub fn program_change_parameter(&self, unit_id: i32) -> Option<(u32, i32)> {
+        self.internal.as_ref()?.program_change_parameter(unit_id)
     }
 
     /// Get a parameter value by ID

@@ -16,6 +16,13 @@ All notable changes to `vst3-host` are documented here. The format is based on
   `Plugin::send_sysex_from_slice_at` copies a message into one; `process` hands each buffer
   back to the reserve instead of freeing it. `send_sysex` is unchanged and still allocates.
 
+### Added
+
+- **`Plugin::program_change_parameter` resolves a unit to its program-change parameter** and
+  program count, from the table a `ProgramChange` is routed by. It neither allocates nor calls
+  the plugin, so an audio thread that bounds its own parameter queues can queue a program
+  change as an ordinary parameter point.
+
 ## [0.9.0] - 2026-07-28
 
 ### Changed (VST3 spec-compliance pass — behavior, some breaking)
