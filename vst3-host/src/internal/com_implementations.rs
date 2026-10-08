@@ -1644,6 +1644,9 @@ pub struct ComponentHandler {
     // Gestures refused at `MAX_EDITOR_FEEDBACK`, here or by the audio thread's capture of the
     // log (`Plugin::capture_parameter_edits`), counted so a host can say some were lost.
     edit_refusals: AtomicU64,
+    // Raised by every `setDirty(true)`, refused or not, and shared with the control link
+    // (`Plugin::control_link`), which takes it without the queue below or the `Plugin`.
+    dirty_raised: Arc<AtomicBool>,
     // Union of every `restartComponent` flag the plugin has raised since the host last drained
     // it. A bitmask rather than a log: the flags are idempotent requests ("my latency changed",
     // "re-read my parameters"), so accumulating them is both complete and inherently bounded —
@@ -1664,6 +1667,7 @@ impl ComponentHandler {
             parameter_changes,
             edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
             edit_refusals: AtomicU64::new(0),
+            dirty_raised: Arc::new(AtomicBool::new(false)),
             restart_flags: AtomicI32::new(0),
             notifications: Arc::new(Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS))),
             context_menus: Arc::new(ContextMenuRegistry::new()),
@@ -1745,6 +1749,11 @@ impl ComponentHandler {
     /// Gestures lost since the plugin loaded; see [`Self::count_edit_refusal`].
     pub(crate) fn edit_refusals(&self) -> u64 {
         self.edit_refusals.load(Ordering::Relaxed)
+    }
+
+    /// The flag every `setDirty(true)` raises, shared.
+    pub(crate) fn dirty_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.dirty_raised)
     }
 
     fn push_notification(&self, notification: crate::plugin::HostNotification) -> bool {
@@ -1849,6 +1858,9 @@ impl IComponentHandler3Trait for ComponentHandler {
 impl IComponentHandler2Trait for ComponentHandler {
     unsafe fn setDirty(&self, state: u8) -> i32 {
         log::debug!("Host: Plugin marked state as dirty (state: {})", state);
+        if state != 0 {
+            self.dirty_raised.store(true, Ordering::Release);
+        }
         if self.push_notification(crate::plugin::HostNotification::DirtyChanged(state != 0)) {
             kResultOk
         } else {
@@ -3063,6 +3075,23 @@ mod component_handler_tests {
             handler.take_host_notifications().len(),
             MAX_HOST_NOTIFICATIONS
         );
+    }
+
+    /// The control link reads `setDirty(true)` from the flag, not the queue, so a full queue
+    /// that refuses the call still raises it, and `setDirty(false)` never does. Breaks by
+    /// raising the flag only when the queue takes the notification.
+    #[test]
+    fn set_dirty_raises_the_shared_flag_even_when_the_queue_refuses() {
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let dirty = handler.dirty_flag();
+        unsafe {
+            for _ in 0..MAX_HOST_NOTIFICATIONS {
+                assert_eq!(handler.setDirty(0), kResultOk);
+            }
+        }
+        assert!(!dirty.load(Ordering::Acquire), "setDirty(false) raised it");
+        unsafe { assert_eq!(handler.setDirty(1), kResultFalse) };
+        assert!(dirty.swap(false, Ordering::AcqRel));
     }
 
     #[test]

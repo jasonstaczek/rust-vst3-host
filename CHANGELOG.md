@@ -26,6 +26,12 @@ All notable changes to `vst3-host` are documented here. The format is based on
   was heard at, taking no lock. A host no longer needs the plugin on its own thread to read
   them. Gestures lost at the log's cap or past the buffer are counted in
   `Plugin::parameter_edit_refusals`. Without the call the log is `take_parameter_edits`' alone.
+- **A control thread can service a plugin without holding it.** `Plugin::control_link` hands
+  out a `ControlLink` whose `service` applies to the edit controller the values `process` was
+  given off the control thread, and whose `take_dirty` reports `setDirty(true)`, raised even
+  when the notification queue is full. A host whose audio thread holds the `Plugin` no longer
+  has to take it for either. The plugin's drop takes the controller out of the link first, so
+  a link that outlives it does nothing.
 
 ### Added
 

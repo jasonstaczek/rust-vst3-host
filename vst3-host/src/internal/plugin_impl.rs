@@ -12,6 +12,7 @@ use crate::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, ThreadId};
 use vst3::Steinberg::Vst::BusDirections_::*;
@@ -228,7 +229,10 @@ pub struct PluginImpl {
     // `IEditController` (the audio callback, via the playback handles). Bounded, lock-free and
     // drop-oldest; the control-thread service paths drain it into setParamNormalized so the
     // plugin's own editor, get_parameter/format_parameter and saved state track the DSP.
-    deferred_controller_sync: ArrayQueue<(u32, f64)>,
+    deferred_controller_sync: Arc<ArrayQueue<(u32, f64)>>,
+    // What `Plugin::control_link` hands out: the controller, the queue above and the dirty flag,
+    // for a control thread that does not hold the `Plugin`.
+    control: Arc<ControlShared>,
 
     // Event handling
     input_events: ComWrapper<HostEventList>,
@@ -1049,15 +1053,8 @@ impl PluginImpl {
     /// automation on real plugins. Log it and carry on; `log` skips the formatting entirely when
     /// the level is disabled.
     fn apply_controller_parameter(&self, id: u32, value: f64) {
-        let Some(controller) = self.controller.as_ref() else {
-            return;
-        };
-        let result = unsafe { controller.setParamNormalized(id, value) };
-        if result != kResultOk && result != kResultTrue {
-            log::debug!(
-                "setParamNormalized({id}) returned {result:#x}; applying anyway \
-                 (many plugins report kResultFalse on success)"
-            );
+        if let Some(controller) = self.controller.as_ref() {
+            set_controller_parameter(controller, id, value);
         }
     }
 
@@ -1484,6 +1481,14 @@ impl PluginImpl {
                 updated_info.vendor
             );
 
+            let deferred_controller_sync = Arc::new(ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC));
+            let control = Arc::new(ControlShared {
+                controller: Mutex::new(controller.clone()),
+                deferred: Arc::clone(&deferred_controller_sync),
+                dirty: component_handler.dirty_flag(),
+                control_thread: thread::current().id(),
+            });
+
             let mut plugin = Self {
                 component,
                 processor,
@@ -1523,7 +1528,8 @@ impl PluginImpl {
                 heard_edits: Vec::new(),
                 output_param_feedback: Arc::new(ArrayQueue::new(MAX_OUTPUT_PARAMETER_FEEDBACK)),
                 output_param_changes: ComWrapper::new(ParameterChanges::default()),
-                deferred_controller_sync: ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC),
+                deferred_controller_sync,
+                control,
                 input_events,
                 output_events,
                 chunk_events: Vec::with_capacity(MAX_QUEUED_EVENTS),
@@ -2930,6 +2936,10 @@ impl PluginInternal for PluginImpl {
         self.component_handler
             .as_ref()
             .map_or(0, |handler| handler.edit_refusals())
+    }
+
+    fn control_link(&self) -> Option<crate::plugin::ControlLink> {
+        Some(crate::plugin::ControlLink::new(Arc::clone(&self.control)))
     }
 
     fn send_sysex_from_slice_at(&mut self, bytes: &[u8], sample_offset: i32) -> bool {
@@ -4566,6 +4576,66 @@ impl PluginImpl {
     }
 }
 
+/// Push a value to the edit controller, tolerating the result codes real plugins return.
+///
+/// The SDK's reference `EditController` answers `kResultTrue` on success and `kResultFalse`
+/// for an id it doesn't own, which makes the code look like a usable success signal — but
+/// shipping plugins don't honour it. Dexed (JUCE) returns `kResultFalse` for parameter ids
+/// 0/1/2 that it then applies correctly, so refusing to apply on a false would break
+/// automation on real plugins. Log it and carry on; `log` skips the formatting entirely when
+/// the level is disabled.
+fn set_controller_parameter(controller: &ComPtr<IEditController>, id: u32, value: f64) {
+    let result = unsafe { controller.setParamNormalized(id, value) };
+    if result != kResultOk && result != kResultTrue {
+        log::debug!(
+            "setParamNormalized({id}) returned {result:#x}; applying anyway \
+             (many plugins report kResultFalse on success)"
+        );
+    }
+}
+
+/// The part of a loaded plugin a control thread reaches through [`crate::plugin::ControlLink`]
+/// while another thread holds the `Plugin`: the controller, the values the audio thread parked
+/// for it, and the dirty flag.
+pub(crate) struct ControlShared {
+    // `PluginImpl::drop` takes it out before the teardown, so a link that outlives the plugin
+    // never calls a terminated controller, nor releases it after the module is unloaded. Only
+    // control-thread calls and that drop take this lock; the audio thread never does.
+    controller: Mutex<Option<ComPtr<IEditController>>>,
+    deferred: Arc<ArrayQueue<(u32, f64)>>,
+    dirty: Arc<AtomicBool>,
+    control_thread: ThreadId,
+}
+
+impl ControlShared {
+    /// Apply the parked values to the controller, oldest first, and return how many. Nothing
+    /// off the control thread, where an `IEditController` call does not belong, or once the
+    /// plugin is gone.
+    pub(crate) fn service(&self) -> usize {
+        if thread::current().id() != self.control_thread {
+            return 0;
+        }
+        let controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(controller) = controller.as_ref() else {
+            return 0;
+        };
+        let mut applied = 0;
+        while let Some((id, value)) = self.deferred.pop() {
+            set_controller_parameter(controller, id, value);
+            applied += 1;
+        }
+        applied
+    }
+
+    /// Whether `setDirty(true)` was called since the last take; clears it.
+    pub(crate) fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+}
+
 /// Map a sample offset within the caller's block onto one chunk of it.
 ///
 /// Returns the offset rebased to the chunk (`0..frames`), or `None` when the offset belongs to
@@ -4812,6 +4882,13 @@ unsafe fn terminate_component(
 
 impl Drop for PluginImpl {
     fn drop(&mut self) {
+        // Before anything is torn down: a control link may outlive the plugin.
+        *self
+            .control
+            .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+
         // VST3 teardown order: detach the editor, stop processing, deactivate the component,
         // disconnect the component/controller connection points, terminate the controller and the
         // component, then drop the COM references. Many plugins (dual-component ones especially)
@@ -5711,6 +5788,38 @@ mod editor_edit_drain_tests {
     }
 
     use crate::plugin::{ParameterEdit, ParameterEditKind};
+
+    fn control(controller: Option<ComPtr<IEditController>>) -> ControlShared {
+        ControlShared {
+            controller: Mutex::new(controller),
+            deferred: Arc::new(ArrayQueue::new(4)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            control_thread: thread::current().id(),
+        }
+    }
+
+    /// A link applies nothing anywhere but the control thread, where an `IEditController`
+    /// call does not belong, and nothing once the plugin dropped the controller; either way
+    /// the values stay parked. Breaks by dropping the thread check (the spawned call pops).
+    #[test]
+    fn a_link_applies_nothing_off_the_control_thread_or_after_the_plugin() {
+        let shared = control(None);
+        shared.deferred.force_push((1, 0.5));
+        let off_thread = thread::scope(|s| s.spawn(|| shared.service()).join().unwrap());
+        assert_eq!(off_thread, 0);
+        assert_eq!(shared.service(), 0, "a dropped controller was called");
+        assert_eq!(shared.deferred.len(), 1, "a parked value was consumed");
+    }
+
+    /// The dirty flag is taken once per raise. Breaks by a take that does not clear it.
+    #[test]
+    fn a_links_dirty_flag_is_taken_once() {
+        let shared = control(None);
+        assert!(!shared.take_dirty());
+        shared.dirty.store(true, Ordering::Release);
+        assert!(shared.take_dirty());
+        assert!(!shared.take_dirty());
+    }
 
     type Heard = Vec<(i32, ParameterEdit)>;
 

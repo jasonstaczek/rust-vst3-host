@@ -356,6 +356,41 @@ pub enum ParameterEditKind {
     EndGesture,
 }
 
+/// What a control thread does for a loaded plugin without holding the [`Plugin`], from
+/// [`Plugin::control_link`].
+///
+/// A host whose audio thread holds the `Plugin` would otherwise take it from that thread for
+/// two chores, and a block that arrives meanwhile cannot render. [`service`](Self::service)
+/// applies to the edit controller the values `process` was handed off the control thread,
+/// which the `Plugin`'s own control-thread calls otherwise apply; call it on the thread that
+/// loaded the plugin, each UI frame, so the plugin's editor follows automation.
+/// [`take_dirty`](Self::take_dirty) reports `setDirty(true)`. The link may outlive the plugin:
+/// after the plugin is dropped `service` does nothing.
+#[derive(Clone)]
+pub struct ControlLink {
+    shared: std::sync::Arc<crate::internal::plugin_impl::ControlShared>,
+}
+
+impl ControlLink {
+    pub(crate) fn new(shared: std::sync::Arc<crate::internal::plugin_impl::ControlShared>) -> Self {
+        Self { shared }
+    }
+
+    /// Apply the values waiting for the edit controller and return how many. On the thread
+    /// that loaded the plugin only; anywhere else, and once the plugin is dropped, nothing.
+    /// It never takes the `Plugin`, and the audio thread never takes the lock it takes.
+    pub fn service(&self) -> usize {
+        self.shared.service()
+    }
+
+    /// Whether the plugin called `IComponentHandler2::setDirty(true)` since the last call, and
+    /// clears it, on any thread. It is raised even when the notification queue
+    /// [`Plugin::take_host_notifications`] drains is full and refuses the call.
+    pub fn take_dirty(&self) -> bool {
+        self.shared.take_dirty()
+    }
+}
+
 /// A single parameter-edit gesture event reported by a plugin's own editor.
 ///
 /// Drained in order via [`Plugin::take_parameter_edits`]. This is the richer superset of
@@ -868,6 +903,10 @@ pub(crate) trait PluginInternal: Send {
     /// Gestures lost at the log's cap or past the capture's buffer. Defaults to 0.
     fn parameter_edit_refusals(&self) -> u64 {
         0
+    }
+    /// The control-thread half reachable without the plugin. Defaults to none.
+    fn control_link(&self) -> Option<ControlLink> {
+        None
     }
     /// Queue a copy of a SysEx message. Defaults to an owned copy through
     /// [`Self::send_plugin_event`], which allocates.
@@ -1866,6 +1905,15 @@ impl Plugin {
         self.internal
             .as_ref()
             .map_or(0, |internal| internal.parameter_edit_refusals())
+    }
+
+    /// The control thread's link to this plugin, for a host whose audio thread holds the
+    /// `Plugin` (behind a lock it only `try_lock`s, say): see [`ControlLink`]. Call it on the
+    /// thread that loaded the plugin. `None` for an isolated plugin.
+    pub fn control_link(&self) -> Option<ControlLink> {
+        self.internal
+            .as_ref()
+            .and_then(|internal| internal.control_link())
     }
 
     /// Queue a copy of the SysEx message `bytes` at a sample offset within the next process
