@@ -402,6 +402,26 @@ impl ControlLink {
     pub fn take_host_notifications(&self) -> Vec<HostNotification> {
         self.shared.take_host_notifications()
     }
+
+    /// Take the `restartComponent` flags [`Plugin::take_restart_flags`] takes, from the same
+    /// word, on any thread, without the `Plugin`; each flag is taken by one or the other. Marks
+    /// the MIDI-mapping and program-change tables a flag leaves stale, for
+    /// [`Self::take_cache_rebuild`]. An atomic swap and an atomic or: it neither waits on nor
+    /// takes a lock, and allocates nothing.
+    pub fn take_restart_flags(&self) -> RestartFlags {
+        self.shared.take_restart_flags()
+    }
+
+    /// Take the MIDI-mapping and program-change tables marked stale since the last rebuild was
+    /// taken, here or by [`Plugin::take_cache_rebuild`], without the `Plugin`: `None` when none
+    /// is, off the thread that loaded the plugin, or once the plugin is dropped. A restart, a
+    /// host-request drain, and after [`Plugin::defer_cache_rebuilds`] a restore of state, program
+    /// data or unit data, mark them. Build it with [`CacheRebuild::build`] and install it with
+    /// [`Plugin::install_caches`]. Reads the event input bus count under a lock the audio thread
+    /// never takes.
+    pub fn take_cache_rebuild(&self) -> Option<CacheRebuild> {
+        self.shared.take_cache_rebuild()
+    }
 }
 
 /// A single parameter-edit gesture event reported by a plugin's own editor.
@@ -2398,11 +2418,14 @@ impl Plugin {
     }
 
     /// Stop rebuilding the MIDI-mapping and program-change tables inside this `Plugin`'s calls,
-    /// for a host that holds it behind a lock the audio thread takes. A restart or a request
-    /// that invalidates them only marks them stale, and the host rebuilds them without the lock:
-    /// [`Self::take_cache_rebuild`] under it, [`CacheRebuild::build`] after releasing it, and
-    /// [`Self::install_caches`] under it again. Until then MIDI is routed by the old tables.
-    /// Call it on the thread that loaded the plugin. Does nothing for an isolated plugin.
+    /// for a host that holds it behind a lock the audio thread takes. A restart, a request that
+    /// invalidates them, a state restore, [`Self::set_program_data`], [`Self::set_unit_data`]
+    /// and a [`Self::select_program`] of a unit the table lacks only mark them stale, and the
+    /// host rebuilds them without the lock: [`ControlLink::take_cache_rebuild`] or
+    /// [`Self::take_cache_rebuild`], [`CacheRebuild::build`] with the lock released, and
+    /// [`Self::install_caches`] under it. Until then MIDI is routed by the old tables, and such
+    /// a `select_program` fails as for an unknown unit. Call it on the thread that loaded the
+    /// plugin. Does nothing for an isolated plugin.
     pub fn defer_cache_rebuilds(&mut self) {
         if let Some(internal) = self.internal.as_mut() {
             internal.defer_cache_rebuilds();

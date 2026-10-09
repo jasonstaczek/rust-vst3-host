@@ -12,7 +12,7 @@ use crate::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, ThreadId};
 use vst3::Steinberg::Vst::BusDirections_::*;
@@ -78,11 +78,59 @@ struct MidiMappingCache {
 ///
 /// Rebuilding either one is a burst of `IEditController` calls, which belong to the main-thread
 /// domain — but notifications arrive on whichever thread the plugin chose. So an off-control
-/// thread only records what went stale here, and the next control-thread entry point rebuilds.
+/// thread only records what went stale, in [`ControlShared`]'s word, and the next control-thread
+/// entry point or a control link's [`ControlShared::take_cache_rebuild`] rebuilds.
 #[derive(Default, Clone, Copy)]
 struct DirtyCaches {
     midi_mapping: bool,
     program_change: bool,
+}
+
+const STALE_MIDI_MAPPING: u8 = 1;
+const STALE_PROGRAM_CHANGE: u8 = 2;
+
+impl DirtyCaches {
+    const PROGRAM_CHANGE: Self = Self {
+        midi_mapping: false,
+        program_change: true,
+    };
+    const BOTH: Self = Self {
+        midi_mapping: true,
+        program_change: true,
+    };
+
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            midi_mapping: bits & STALE_MIDI_MAPPING != 0,
+            program_change: bits & STALE_PROGRAM_CHANGE != 0,
+        }
+    }
+
+    fn bits(self) -> u8 {
+        let midi_mapping = if self.midi_mapping {
+            STALE_MIDI_MAPPING
+        } else {
+            0
+        };
+        let program_change = if self.program_change {
+            STALE_PROGRAM_CHANGE
+        } else {
+            0
+        };
+        midi_mapping | program_change
+    }
+
+    /// The tables a `restartComponent` with `flags` leaves stale.
+    fn from_restart(flags: crate::plugin::RestartFlags) -> Self {
+        let bits = flags.bits();
+        let params = bits
+            & (RestartFlags_::kParamIDMappingChanged | RestartFlags_::kParamTitlesChanged)
+            != 0;
+        Self {
+            midi_mapping: params || bits & RestartFlags_::kMidiCCAssignmentChanged != 0,
+            program_change: params,
+        }
+    }
 }
 
 impl MidiMappingCache {
@@ -106,20 +154,13 @@ fn midi_mapping_bus_count(reported: i32) -> usize {
     (reported.max(0) as usize).min(MAX_MIDI_MAPPING_BUSES)
 }
 
-/// The generation each controller-derived table was built at. A table built off the lock is
-/// installed only over an older one, so a rebuild that finished late never replaces a newer.
+/// The generation each installed controller-derived table was built at, issued by
+/// [`ControlShared::issue_generation`]. A table built off the lock is installed only over an
+/// older one, so a rebuild that finished late never replaces a newer.
 #[derive(Default)]
 struct CacheGenerations {
-    issued: u64,
     midi_mapping: u64,
     program_change: u64,
-}
-
-impl CacheGenerations {
-    fn issue(&mut self) -> u64 {
-        self.issued += 1;
-        self.issued
-    }
 }
 
 /// Controller-derived tables, either of which may be absent.
@@ -290,16 +331,16 @@ unsafe fn build_program_change(
 
 /// Swap each table in `built` into its place where it is newer than what is there, and return what it
 /// replaced, or the built table itself when it was not newer. A table that was wanted and not
-/// built is marked stale again in `dirty`; a mark a restart left meanwhile is kept, so the
-/// installed table is rebuilt once more. Swaps only, so it neither allocates nor frees.
+/// built is marked stale again; a mark a restart left meanwhile is kept, so the installed table
+/// is rebuilt once more. Swaps and atomics only, so it neither allocates, frees nor waits.
 fn install_tables(
     midi_mapping: &mut MidiMappingCache,
     program_change: &mut Vec<ProgramChangeMapping>,
     generations: &mut CacheGenerations,
-    dirty: &mut DirtyCaches,
     mut built: BuiltCaches,
 ) -> ReplacedCaches {
     let mut replaced = CacheTables::default();
+    let mut unbuilt = DirtyCaches::default();
     if built.wanted.midi_mapping {
         match built.tables.midi_mapping.take() {
             Some(table) if built.generation > generations.midi_mapping => {
@@ -307,7 +348,7 @@ fn install_tables(
                 replaced.midi_mapping = Some(std::mem::replace(midi_mapping, table));
             }
             Some(table) => replaced.midi_mapping = Some(table),
-            None => dirty.midi_mapping = true,
+            None => unbuilt.midi_mapping = true,
         }
     }
     if built.wanted.program_change {
@@ -317,9 +358,10 @@ fn install_tables(
                 replaced.program_change = Some(std::mem::replace(program_change, table));
             }
             Some(table) => replaced.program_change = Some(table),
-            None => dirty.program_change = true,
+            None => unbuilt.program_change = true,
         }
     }
+    built.shared.mark_stale(unbuilt);
     ReplacedCaches { _tables: replaced }
 }
 
@@ -408,7 +450,6 @@ pub struct PluginImpl {
     // the callback; `restartComponent` merely records invalidation flags atomically.
     midi_mapping_cache: MidiMappingCache,
     program_change_cache: Vec<ProgramChangeMapping>,
-    dirty_caches: DirtyCaches,
     cache_generations: CacheGenerations,
     // Set by `defer_cache_rebuilds`: a control-thread entry leaves stale tables for
     // `take_cache_rebuild` rather than rebuilding them under the caller's lock.
@@ -1316,26 +1357,40 @@ impl PluginImpl {
         if self.defer_cache_rebuilds {
             return;
         }
-        if std::mem::take(&mut self.dirty_caches.midi_mapping) {
+        let stale = self.control.take_stale();
+        if stale.midi_mapping {
             self.refresh_midi_mapping_cache();
         }
-        if std::mem::take(&mut self.dirty_caches.program_change) {
+        if stale.program_change {
             self.refresh_program_change_cache();
         }
     }
 
     /// Take the mark a drain of the host requests left when it passed one that invalidates the
-    /// unit cache: forget the units and mark the program-change table stale. Control thread.
+    /// unit cache, and forget the units; the drain marked the program-change table stale itself.
+    /// Control thread.
     fn adopt_stale_units(&mut self) {
         if self.control.take_units_stale() {
             *self
                 .unit_cache
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = None;
-            // Mark the program-change table stale rather than clearing it: an emptied table
-            // silently turns every MIDI ProgramChange into a no-op until something else happens
-            // to rebuild it, whereas a stale table still routes to the previous parameter.
-            self.dirty_caches.program_change = true;
+        }
+    }
+
+    /// A call on the control thread left `stale` out of date: rebuild them here, or, after
+    /// `defer_cache_rebuilds`, mark them for `take_cache_rebuild`, so the caller's lock is not
+    /// held across the controller calls. Until then MIDI is routed by the old tables.
+    fn controller_tables_changed(&mut self, stale: DirtyCaches) {
+        if self.defer_cache_rebuilds {
+            self.control.mark_stale(stale);
+            return;
+        }
+        if stale.midi_mapping {
+            self.refresh_midi_mapping_cache();
+        }
+        if stale.program_change {
+            self.refresh_program_change_cache();
         }
     }
 
@@ -1344,35 +1399,22 @@ impl PluginImpl {
             midi_mapping_bus_count(self.component.getBusCount(kEvent as i32, kInput as i32))
         };
         self.midi_mapping_cache = unsafe { build_midi_mapping(self.controller.as_ref(), buses) };
-        self.cache_generations.midi_mapping = self.cache_generations.issue();
+        self.cache_generations.midi_mapping = self.control.issue_generation();
     }
 
     fn refresh_program_change_cache(&mut self) {
         self.program_change_cache = unsafe { build_program_change(self.controller.as_ref()) };
-        self.cache_generations.program_change = self.cache_generations.issue();
+        self.cache_generations.program_change = self.control.issue_generation();
     }
 
-    /// Take the stale tables for a rebuild off the caller's lock, adopting first any stale mark
-    /// a host-request drain left. `None` when nothing is stale or off the control thread. The
-    /// bus count is read here, since the component is the `Plugin`'s.
+    /// Take the stale tables for a rebuild off the caller's lock, forgetting first the units a
+    /// host-request drain left stale. `None` when nothing is stale or off the control thread.
     fn take_stale_tables(&mut self) -> Option<CacheRebuild> {
         if thread::current().id() != self.control_thread {
             return None;
         }
         self.adopt_stale_units();
-        let dirty = std::mem::take(&mut self.dirty_caches);
-        if !dirty.midi_mapping && !dirty.program_change {
-            return None;
-        }
-        let midi_buses = dirty.midi_mapping.then(|| unsafe {
-            midi_mapping_bus_count(self.component.getBusCount(kEvent as i32, kInput as i32))
-        });
-        Some(CacheRebuild {
-            shared: Arc::clone(&self.control),
-            generation: self.cache_generations.issue(),
-            midi_buses,
-            program_change: dirty.program_change,
-        })
+        self.control.take_cache_rebuild()
     }
 
     /// Install tables a rebuild of this plugin built; see `install_tables`. Tables built for
@@ -1385,7 +1427,6 @@ impl PluginImpl {
             &mut self.midi_mapping_cache,
             &mut self.program_change_cache,
             &mut self.cache_generations,
-            &mut self.dirty_caches,
             built,
         )
     }
@@ -1690,6 +1731,10 @@ impl PluginImpl {
                 progress: host_app.progress_queue(),
                 spare: Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS)),
                 units_stale: AtomicBool::new(false),
+                component: Mutex::new(Some(component.clone())),
+                restart: component_handler.restart_word(),
+                stale: AtomicU8::new(0),
+                generation: AtomicU64::new(0),
                 control_thread: thread::current().id(),
             });
 
@@ -1719,7 +1764,6 @@ impl PluginImpl {
                 ordinary_note_counts: [0; MIDI_CHANNEL_COUNT * 128],
                 midi_mapping_cache: MidiMappingCache::default(),
                 program_change_cache: Vec::new(),
-                dirty_caches: DirtyCaches::default(),
                 cache_generations: CacheGenerations::default(),
                 defer_cache_rebuilds: false,
                 unit_cache: Mutex::new(None),
@@ -3615,23 +3659,9 @@ impl PluginInternal for PluginImpl {
     }
 
     fn take_restart_flags(&mut self) -> crate::plugin::RestartFlags {
-        let flags = self
-            .component_handler
-            .as_ref()
-            .map(|h| h.take_restart_flags())
-            .unwrap_or_default();
-        let bits = flags.bits();
-        // `restartComponent` can arrive on any thread, and rebuilding these tables is a burst of
-        // main-thread-domain controller calls (the MIDI map alone is buses × 16 × 130 of them).
-        // So record what went stale and let the control thread rebuild.
-        if bits & RestartFlags_::kMidiCCAssignmentChanged != 0 {
-            self.dirty_caches.midi_mapping = true;
-        }
-        if bits & (RestartFlags_::kParamIDMappingChanged | RestartFlags_::kParamTitlesChanged) != 0
-        {
-            self.dirty_caches.midi_mapping = true;
-            self.dirty_caches.program_change = true;
-        }
+        // The control link takes the same word, so each flag is taken by one or the other, and
+        // either marks the tables it leaves stale.
+        let flags = self.control.take_restart_flags();
         self.service_control_thread_caches();
         flags
     }
@@ -3896,7 +3926,7 @@ impl PluginInternal for PluginImpl {
             ));
         }
         // A control link's drain may have passed a notification that invalidates the cache;
-        // the mark itself stays for `adopt_stale_units`, which also owes the program-change table.
+        // the mark itself stays for `adopt_stale_units`.
         if self.control.units_stale() {
             *self
                 .unit_cache
@@ -3971,7 +4001,7 @@ impl PluginInternal for PluginImpl {
         if self.cached_program_change(unit_id).is_none()
             && thread::current().id() == self.control_thread
         {
-            self.refresh_program_change_cache();
+            self.controller_tables_changed(DirtyCaches::PROGRAM_CHANGE);
         }
         let mapping = self.cached_program_change(unit_id).ok_or_else(|| {
             Error::InvalidParameter(format!(
@@ -4161,7 +4191,7 @@ impl PluginInternal for PluginImpl {
                     .unit_cache
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = None;
-                self.refresh_program_change_cache();
+                self.controller_tables_changed(DirtyCaches::PROGRAM_CHANGE);
                 Ok(())
             } else {
                 Err(Error::Other(format!(
@@ -4227,7 +4257,7 @@ impl PluginInternal for PluginImpl {
                     .unit_cache
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = None;
-                self.refresh_program_change_cache();
+                self.controller_tables_changed(DirtyCaches::PROGRAM_CHANGE);
                 Ok(())
             } else {
                 Err(Error::Other(format!(
@@ -4554,8 +4584,7 @@ impl PluginInternal for PluginImpl {
                     .unit_cache
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = None;
-                self.refresh_midi_mapping_cache();
-                self.refresh_program_change_cache();
+                self.controller_tables_changed(DirtyCaches::BOTH);
                 Ok(())
             })();
 
@@ -4822,8 +4851,18 @@ pub(crate) struct ControlShared {
     // so the plugin's next push into the queue it swapped in never reallocates.
     spare: Mutex<Vec<crate::plugin::HostNotification>>,
     // Raised by a drain that passed a request invalidating the unit cache; the `Plugin` takes
-    // it at its next control-thread entry, since only it holds the caches.
+    // it at its next control-thread entry, since only it holds the unit cache.
     units_stale: AtomicBool,
+    // Taken out with `controller`, and for the same reason: read for the event input bus count
+    // a MIDI-mapping rebuild sizes its table by.
+    component: Mutex<Option<ComPtr<IComponent>>>,
+    // The handler's `restartComponent` word.
+    restart: Arc<AtomicI32>,
+    // `STALE_*` bits: the controller-derived tables out of date since the last rebuild was
+    // taken. Atomic, so any thread marks it and a link takes it without the `Plugin`.
+    stale: AtomicU8,
+    // The last generation a rebuild or an in-call refresh was issued.
+    generation: AtomicU64,
     control_thread: ThreadId,
 }
 
@@ -4890,8 +4929,72 @@ impl ControlShared {
             .any(crate::plugin::HostNotification::invalidates_unit_cache)
         {
             self.units_stale.store(true, Ordering::Release);
+            // Marked stale rather than cleared: an emptied table silently turns every MIDI
+            // ProgramChange into a no-op until something rebuilds it, whereas a stale table still
+            // routes to the previous parameter.
+            self.mark_stale(DirtyCaches::PROGRAM_CHANGE);
         }
         taken
+    }
+
+    /// Take the plugin's `restartComponent` flags and mark the tables they leave stale, on any
+    /// thread: an atomic swap and an atomic or, so it neither waits nor allocates.
+    pub(crate) fn take_restart_flags(&self) -> crate::plugin::RestartFlags {
+        let flags = crate::plugin::RestartFlags::from_bits(self.restart.swap(0, Ordering::AcqRel));
+        self.mark_stale(DirtyCaches::from_restart(flags));
+        flags
+    }
+
+    /// Mark `stale` out of date, on any thread, until a rebuild is taken.
+    fn mark_stale(&self, stale: DirtyCaches) {
+        let bits = stale.bits();
+        if bits != 0 {
+            self.stale.fetch_or(bits, Ordering::AcqRel);
+        }
+    }
+
+    /// Take the stale marks, clearing them.
+    fn take_stale(&self) -> DirtyCaches {
+        DirtyCaches::from_bits(self.stale.swap(0, Ordering::AcqRel))
+    }
+
+    /// A generation newer than any issued before.
+    fn issue_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Take the tables marked stale for a rebuild, without the `Plugin`: `None` when none is,
+    /// off the control thread, or once the plugin is gone. The marks are cleared before the
+    /// generation is issued, so a mark set after this take survives it and the next take, newer,
+    /// rebuilds over what this one builds. Takes the component's lock, which the audio thread
+    /// never takes, to read the event input bus count.
+    pub(crate) fn take_cache_rebuild(self: &Arc<Self>) -> Option<CacheRebuild> {
+        if thread::current().id() != self.control_thread {
+            return None;
+        }
+        let component = self
+            .component
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let component = component.as_ref()?;
+        self.take_rebuild_sized(|| unsafe {
+            midi_mapping_bus_count(component.getBusCount(kEvent as i32, kInput as i32))
+        })
+    }
+
+    /// The body of [`Self::take_cache_rebuild`], with the bus count read by `buses` only when
+    /// the MIDI map is stale.
+    fn take_rebuild_sized(self: &Arc<Self>, buses: impl FnOnce() -> usize) -> Option<CacheRebuild> {
+        let stale = self.take_stale();
+        if !stale.midi_mapping && !stale.program_change {
+            return None;
+        }
+        Some(CacheRebuild {
+            shared: Arc::clone(self),
+            generation: self.issue_generation(),
+            midi_buses: stale.midi_mapping.then(buses),
+            program_change: stale.program_change,
+        })
     }
 
     /// Whether a drain left the unit cache stale since the `Plugin` last took the mark.
@@ -5155,6 +5258,11 @@ impl Drop for PluginImpl {
         *self
             .control
             .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        *self
+            .control
+            .component
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = None;
 
@@ -5860,6 +5968,10 @@ mod midi_mapping_cache_tests {
             progress: create_host_application().progress_queue(),
             spare: Mutex::new(Vec::new()),
             units_stale: AtomicBool::new(false),
+            component: Mutex::new(None),
+            restart: Arc::new(AtomicI32::new(0)),
+            stale: AtomicU8::new(0),
+            generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
         })
     }
@@ -5887,19 +5999,13 @@ mod midi_mapping_cache_tests {
             program_count: 2,
         }];
         let mut generations = CacheGenerations::default();
-        let built = rebuild(&shared, generations.issue(), 2).build();
+        let built = rebuild(&shared, shared.issue_generation(), 2).build();
         // A restart marked the map stale again while it was built.
-        let mut dirty = DirtyCaches {
-            midi_mapping: true,
-            program_change: false,
-        };
-        let replaced = install_tables(
-            &mut midi,
-            &mut programs,
-            &mut generations,
-            &mut dirty,
-            built,
-        );
+        shared
+            .restart
+            .fetch_or(RestartFlags_::kMidiCCAssignmentChanged, Ordering::AcqRel);
+        shared.take_restart_flags();
+        let replaced = install_tables(&mut midi, &mut programs, &mut generations, built);
         assert_eq!(midi.buses, 2, "the built map was not installed");
         assert_eq!(
             midi.assignments.len(),
@@ -5919,11 +6025,71 @@ mod midi_mapping_cache_tests {
             Some(0),
             "the old map was not handed back"
         );
+        let dirty = shared.take_stale();
         assert!(
             dirty.midi_mapping,
             "the install cleared a mark left meanwhile"
         );
         assert!(!dirty.program_change);
+    }
+
+    /// A restart the control link takes marks the tables its flags name, and the rebuild the link
+    /// takes clears the marks and is issued a newer generation than any before; a restart flagged
+    /// while that rebuild is built leaves its mark through the install, so the next take rebuilds
+    /// again, newer, and that table replaces the first. Breaks by a link take that marks nothing,
+    /// one that leaves the marks for a second take, an install that clears a mark, or a
+    /// generation issued twice.
+    #[test]
+    fn a_restart_flagged_while_the_links_rebuild_is_built_is_rebuilt_after_it() {
+        let shared = shared();
+        let mut midi = MidiMappingCache::default();
+        let mut programs = Vec::new();
+        let mut generations = CacheGenerations::default();
+        shared
+            .restart
+            .fetch_or(RestartFlags_::kMidiCCAssignmentChanged, Ordering::AcqRel);
+        let flags = shared.take_restart_flags();
+        assert_eq!(flags.bits(), RestartFlags_::kMidiCCAssignmentChanged);
+        assert_eq!(
+            shared.restart.load(Ordering::Acquire),
+            0,
+            "the flags are taken"
+        );
+        let first = shared.take_rebuild_sized(|| 1).expect("the map is stale");
+        assert_eq!(first.midi_buses, Some(1));
+        assert!(!first.program_change, "only the map was marked");
+        assert!(
+            shared.take_rebuild_sized(|| 1).is_none(),
+            "the take left its marks"
+        );
+
+        // The plugin restarts while the first rebuild is built.
+        shared
+            .restart
+            .fetch_or(RestartFlags_::kParamTitlesChanged, Ordering::AcqRel);
+        shared.take_restart_flags();
+        let first_generation = first.generation;
+        drop(install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            first.build(),
+        ));
+        assert_eq!(midi.buses, 1, "the first rebuild was installed");
+
+        let second = shared
+            .take_rebuild_sized(|| 2)
+            .expect("the restart's mark survived the install");
+        assert!(second.generation > first_generation);
+        assert_eq!(second.midi_buses, Some(2));
+        assert!(second.program_change);
+        drop(install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            second.build(),
+        ));
+        assert_eq!(midi.buses, 2, "the newer rebuild replaced the first");
     }
 
     /// A rebuild finished after a newer one was installed is handed back, not installed, and a
@@ -5935,29 +6101,22 @@ mod midi_mapping_cache_tests {
         let mut midi = MidiMappingCache::default();
         let mut programs = Vec::new();
         let mut generations = CacheGenerations::default();
-        let older = rebuild(&shared, generations.issue(), 1).build();
-        let newer = rebuild(&shared, generations.issue(), 3).build();
-        let mut dirty = DirtyCaches::default();
+        let older = rebuild(&shared, shared.issue_generation(), 1).build();
+        let newer = rebuild(&shared, shared.issue_generation(), 3).build();
         drop(install_tables(
             &mut midi,
             &mut programs,
             &mut generations,
-            &mut dirty,
             newer,
         ));
-        let replaced = install_tables(
-            &mut midi,
-            &mut programs,
-            &mut generations,
-            &mut dirty,
-            older,
-        );
+        let replaced = install_tables(&mut midi, &mut programs, &mut generations, older);
         assert_eq!(midi.buses, 3, "an older map replaced a newer one");
         assert_eq!(replaced._tables.midi_mapping.map(|m| m.buses), Some(1));
+        let dirty = shared.take_stale();
         assert!(!dirty.midi_mapping && !dirty.program_change);
 
         let off_thread = thread::scope(|s| {
-            s.spawn(|| rebuild(&shared, generations.issue(), 4).build())
+            s.spawn(|| rebuild(&shared, shared.issue_generation(), 4).build())
                 .join()
                 .unwrap()
         });
@@ -5969,10 +6128,10 @@ mod midi_mapping_cache_tests {
             &mut midi,
             &mut programs,
             &mut generations,
-            &mut dirty,
             off_thread,
         ));
         assert_eq!(midi.buses, 3);
+        let dirty = shared.take_stale();
         assert!(
             dirty.midi_mapping && dirty.program_change,
             "an unbuilt table was not left stale"
@@ -6195,6 +6354,10 @@ mod editor_edit_drain_tests {
             progress: create_host_application().progress_queue(),
             spare: Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS)),
             units_stale: AtomicBool::new(false),
+            component: Mutex::new(None),
+            restart: Arc::new(AtomicI32::new(0)),
+            stale: AtomicU8::new(0),
+            generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
         }
     }
@@ -6224,8 +6387,8 @@ mod editor_edit_drain_tests {
 
     /// A link's drain takes the handler's requests and the `IProgress` ones, in that order,
     /// so a plugin the full queue refused is heard again, and a request that invalidates the
-    /// unit cache leaves the mark for the `Plugin`, once. Breaks by a drain that leaves either
-    /// queue full or forgets the mark.
+    /// unit cache leaves the mark for the `Plugin`, once, and the program-change table stale for
+    /// a link's rebuild. Breaks by a drain that leaves either queue full or forgets a mark.
     #[test]
     fn a_links_drain_frees_both_queues_and_marks_the_units_stale_once() {
         use crate::plugin::HostNotification;
@@ -6260,6 +6423,7 @@ mod editor_edit_drain_tests {
             Some(HostNotification::ProgressStarted { .. })
         ));
         assert!(!shared.units_stale(), "no request invalidated the units");
+        assert!(!shared.take_stale().program_change);
 
         unsafe {
             assert_eq!(handler.setDirty(1), kResultOk, "the drained queue takes it");
@@ -6267,6 +6431,10 @@ mod editor_edit_drain_tests {
         }
         assert_eq!(shared.take_host_notifications().len(), 2);
         assert!(shared.units_stale());
+        assert!(
+            shared.take_stale().program_change,
+            "the drain left the program-change table stale for a link's rebuild"
+        );
         assert!(shared.take_units_stale());
         assert!(!shared.take_units_stale(), "the mark is taken once");
     }

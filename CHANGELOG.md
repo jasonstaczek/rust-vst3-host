@@ -52,6 +52,12 @@ All notable changes to `vst3-host` are documented here. The format is based on
   of them) with the lock released, and `Plugin::install_caches` swaps the tables in and hands
   the old ones back to drop after the lock. A table that a restart marked stale again while it
   was built is rebuilt next time; a late build never replaces a newer table.
+- **A control link takes the restart flags and the stale tables without the `Plugin`.**
+  `ControlLink::take_restart_flags` and `ControlLink::take_cache_rebuild` read atomics the
+  plugin and its handler share, so a host's idle poll takes no lock the audio thread takes,
+  and takes the `Plugin` only to install tables it built. After `defer_cache_rebuilds`, a
+  state restore, `set_program_data`, `set_unit_data` and a `select_program` of a unit the
+  table lacks also mark the tables stale rather than rebuild them inside the call.
 
 ### Added
 

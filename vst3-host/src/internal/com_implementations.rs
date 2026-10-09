@@ -1679,7 +1679,8 @@ pub struct ComponentHandler {
     // it. A bitmask rather than a log: the flags are idempotent requests ("my latency changed",
     // "re-read my parameters"), so accumulating them is both complete and inherently bounded —
     // a plugin that spams restartComponent while nothing polls costs one word, not a queue.
-    restart_flags: AtomicI32,
+    // Shared with the control link (`Plugin::control_link`), which takes it without the `Plugin`.
+    restart_flags: Arc<AtomicI32>,
     // Ordered IComponentHandler2 / IUnitHandler / IProgress / context-menu requests. These are
     // control-plane work items, never executed from inside the plugin callback. Ordered against
     // themselves only — not against `edits`. Capped at MAX_HOST_NOTIFICATIONS, and a push past
@@ -1696,13 +1697,15 @@ impl ComponentHandler {
             edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
             edit_refusals: AtomicU64::new(0),
             dirty_raised: Arc::new(AtomicBool::new(false)),
-            restart_flags: AtomicI32::new(0),
+            restart_flags: Arc::new(AtomicI32::new(0)),
             notifications: Arc::new(Mutex::new(Vec::with_capacity(MAX_HOST_NOTIFICATIONS))),
             context_menus: Arc::new(ContextMenuRegistry::new()),
         }
     }
 
-    /// Take the accumulated `restartComponent` flags, clearing them.
+    /// Take the accumulated `restartComponent` flags, clearing them. The `Plugin` and its control
+    /// link take them through [`Self::restart_word`].
+    #[cfg(test)]
     pub fn take_restart_flags(&self) -> crate::plugin::RestartFlags {
         crate::plugin::RestartFlags::from_bits(self.restart_flags.swap(0, Ordering::AcqRel))
     }
@@ -1784,6 +1787,11 @@ impl ComponentHandler {
     /// The flag every `setDirty(true)` raises, shared.
     pub(crate) fn dirty_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.dirty_raised)
+    }
+
+    /// The word `restartComponent` raises its flags in, shared.
+    pub(crate) fn restart_word(&self) -> Arc<AtomicI32> {
+        Arc::clone(&self.restart_flags)
     }
 
     /// The request queue, shared with the control link, which drains it for the `Plugin`.
