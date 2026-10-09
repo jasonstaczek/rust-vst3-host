@@ -402,10 +402,10 @@ impl PluginWindow {
                 data: title.as_bytes(),
             });
 
-            // Show the window, then attach the plugin editor to its X11 id.
-            connection.send_request(&xcb::x::MapWindow { window });
+            // Attach the plugin editor to the unmapped window's X11 id, fit the window to it,
+            // and only then map it, so it first shows at the editor's size and not the
+            // placeholder's, as the macOS and Windows arms do.
             let _ = connection.flush();
-
             let handle = crate::plugin::WindowHandle::from_x11(window.resource_id());
             let size = {
                 let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
@@ -416,6 +416,10 @@ impl PluginWindow {
             self.native_window = Some(XcbWindowState { connection, window });
             if let Ok((width, height)) = size {
                 self.resize_native_window(width, height);
+            }
+            if let Some(state) = self.native_window.as_ref() {
+                state.connection.send_request(&xcb::x::MapWindow { window });
+                let _ = state.connection.flush();
             }
         }
 
