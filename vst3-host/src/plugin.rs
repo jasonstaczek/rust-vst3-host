@@ -10,6 +10,8 @@ use crate::{
     parameters::{Parameter, ParameterUpdate},
 };
 use crossbeam_queue::ArrayQueue;
+
+pub use crate::internal::plugin_impl::{BuiltCaches, CacheRebuild, ReplacedCaches};
 use std::sync::{Arc, Mutex};
 
 /// A `Send` + `Sync` handle for draining the MIDI a plugin emits (arpeggiators, MPE, MIDI
@@ -1036,6 +1038,17 @@ pub(crate) trait PluginInternal: Send {
     /// empty for implementations that don't record them.
     fn take_restart_flags(&mut self) -> RestartFlags {
         RestartFlags::default()
+    }
+    /// Leave stale controller-derived tables for [`Self::take_cache_rebuild`]. Defaults to
+    /// nothing, for implementations that keep no tables.
+    fn defer_cache_rebuilds(&mut self) {}
+    /// Take the stale tables for a rebuild off the caller's lock. Defaults to none.
+    fn take_cache_rebuild(&mut self) -> Option<CacheRebuild> {
+        None
+    }
+    /// Install tables a rebuild built. Defaults to handing them back.
+    fn install_caches(&mut self, built: BuiltCaches) -> ReplacedCaches {
+        built.into()
     }
     /// Drain and service restart requests which require a component lifecycle transition.
     fn service_host_requests(&mut self) -> Result<RestartFlags> {
@@ -2382,6 +2395,37 @@ impl Plugin {
             .as_mut()
             .map(|i| i.take_restart_flags())
             .unwrap_or_default()
+    }
+
+    /// Stop rebuilding the MIDI-mapping and program-change tables inside this `Plugin`'s calls,
+    /// for a host that holds it behind a lock the audio thread takes. A restart or a request
+    /// that invalidates them only marks them stale, and the host rebuilds them without the lock:
+    /// [`Self::take_cache_rebuild`] under it, [`CacheRebuild::build`] after releasing it, and
+    /// [`Self::install_caches`] under it again. Until then MIDI is routed by the old tables.
+    /// Call it on the thread that loaded the plugin. Does nothing for an isolated plugin.
+    pub fn defer_cache_rebuilds(&mut self) {
+        if let Some(internal) = self.internal.as_mut() {
+            internal.defer_cache_rebuilds();
+        }
+    }
+
+    /// Take the tables marked stale since the last rebuild, or `None` when none is, the plugin
+    /// is isolated, or the call is off the thread that loaded it. Call
+    /// [`Self::take_restart_flags`] first, which marks them. Reads the event input bus count.
+    pub fn take_cache_rebuild(&mut self) -> Option<CacheRebuild> {
+        self.internal.as_mut()?.take_cache_rebuild()
+    }
+
+    /// Swap in the tables `built` holds, each only over an older one, and hand back what they
+    /// replaced, to be dropped after releasing the lock. A table that could not be built, and
+    /// one a restart marked stale again while it was being built, stays stale for the next
+    /// [`Self::take_cache_rebuild`]. Neither allocates nor frees, so it holds the lock only for
+    /// the swap.
+    pub fn install_caches(&mut self, built: BuiltCaches) -> ReplacedCaches {
+        match self.internal.as_mut() {
+            Some(internal) => internal.install_caches(built),
+            None => built.into(),
+        }
     }
 
     /// Service pending restart requests on the caller's control thread.

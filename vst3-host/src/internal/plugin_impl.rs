@@ -106,6 +106,223 @@ fn midi_mapping_bus_count(reported: i32) -> usize {
     (reported.max(0) as usize).min(MAX_MIDI_MAPPING_BUSES)
 }
 
+/// The generation each controller-derived table was built at. A table built off the lock is
+/// installed only over an older one, so a rebuild that finished late never replaces a newer.
+#[derive(Default)]
+struct CacheGenerations {
+    issued: u64,
+    midi_mapping: u64,
+    program_change: u64,
+}
+
+impl CacheGenerations {
+    fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+}
+
+/// Controller-derived tables, either of which may be absent.
+#[derive(Default)]
+struct CacheTables {
+    midi_mapping: Option<MidiMappingCache>,
+    program_change: Option<Vec<ProgramChangeMapping>>,
+}
+
+/// The stale tables of a plugin, taken under its lock by
+/// [`crate::plugin::Plugin::take_cache_rebuild`] to be rebuilt without it by [`Self::build`].
+#[must_use = "the plugin keeps its old tables until a built rebuild is installed"]
+pub struct CacheRebuild {
+    shared: Arc<ControlShared>,
+    generation: u64,
+    midi_buses: Option<usize>,
+    program_change: bool,
+}
+
+impl CacheRebuild {
+    /// Build the tables this rebuild was taken for from the controller, without the `Plugin`:
+    /// the MIDI map's `buses × 16 × 130` lookups and the program-change scan. On the thread that
+    /// loaded the plugin only; anywhere else nothing is built, and the install leaves the tables
+    /// stale. Takes the control link's controller lock, which the audio thread never takes.
+    pub fn build(self) -> BuiltCaches {
+        let mut tables = CacheTables::default();
+        if thread::current().id() == self.shared.control_thread {
+            let controller = self
+                .shared
+                .controller
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let controller = controller.as_ref();
+            if let Some(buses) = self.midi_buses {
+                tables.midi_mapping = Some(unsafe { build_midi_mapping(controller, buses) });
+            }
+            if self.program_change {
+                tables.program_change = Some(unsafe { build_program_change(controller) });
+            }
+        }
+        BuiltCaches {
+            shared: self.shared,
+            generation: self.generation,
+            wanted: DirtyCaches {
+                midi_mapping: self.midi_buses.is_some(),
+                program_change: self.program_change,
+            },
+            tables,
+        }
+    }
+}
+
+/// Tables built by [`CacheRebuild::build`], for [`crate::plugin::Plugin::install_caches`].
+#[must_use = "the plugin keeps its old tables until these are installed"]
+pub struct BuiltCaches {
+    shared: Arc<ControlShared>,
+    generation: u64,
+    wanted: DirtyCaches,
+    tables: CacheTables,
+}
+
+/// The tables an install replaced. Drop them after releasing the plugin's lock, so neither the
+/// lock's holder nor the audio thread frees them.
+#[derive(Default)]
+pub struct ReplacedCaches {
+    _tables: CacheTables,
+}
+
+impl From<BuiltCaches> for ReplacedCaches {
+    fn from(built: BuiltCaches) -> Self {
+        Self {
+            _tables: built.tables,
+        }
+    }
+}
+
+/// Look up every `(bus, channel, controller)` assignment the controller's `IMidiMapping` makes
+/// for `buses` event inputs. An empty table of that size when there is no mapping. Controller
+/// calls: control thread only.
+unsafe fn build_midi_mapping(
+    controller: Option<&ComPtr<IEditController>>,
+    buses: usize,
+) -> MidiMappingCache {
+    let mut cache = MidiMappingCache {
+        buses,
+        assignments: vec![None; buses * MIDI_CHANNEL_COUNT * MIDI_CONTROLLER_COUNT],
+    };
+    let Some(mapping) = controller.and_then(|controller| controller.cast::<IMidiMapping>()) else {
+        return cache;
+    };
+    unsafe {
+        for bus in 0..buses {
+            for channel in 0..MIDI_CHANNEL_COUNT {
+                for controller in 0..MIDI_CONTROLLER_COUNT {
+                    let mut id = 0;
+                    if mapping.getMidiControllerAssignment(
+                        bus as i32,
+                        channel as i16,
+                        controller as CtrlNumber,
+                        &mut id,
+                    ) == kResultOk
+                    {
+                        let index = (bus * MIDI_CHANNEL_COUNT + channel) * MIDI_CONTROLLER_COUNT
+                            + controller;
+                        cache.assignments[index] = Some(id);
+                    }
+                }
+            }
+        }
+    }
+    cache
+}
+
+/// Each unit's program-change parameter and its program count, from the controller's
+/// `IUnitInfo`. Controller calls: control thread only.
+unsafe fn build_program_change(
+    controller: Option<&ComPtr<IEditController>>,
+) -> Vec<ProgramChangeMapping> {
+    let mut table = Vec::new();
+    let Some(controller) = controller else {
+        return table;
+    };
+    let Some(unit_info) = controller.cast::<IUnitInfo>() else {
+        return table;
+    };
+    unsafe {
+        let mut unit_lists = Vec::new();
+        for index in 0..unit_info.getUnitCount() {
+            let mut unit: UnitInfo = std::mem::zeroed();
+            if unit_info.getUnitInfo(index, &mut unit) == kResultOk {
+                unit_lists.push((unit.id, unit.programListId));
+            }
+        }
+        let mut list_counts = Vec::new();
+        for index in 0..unit_info.getProgramListCount() {
+            let mut list: ProgramListInfo = std::mem::zeroed();
+            if unit_info.getProgramListInfo(index, &mut list) == kResultOk {
+                list_counts.push((list.id, list.programCount));
+            }
+        }
+        for index in 0..controller.getParameterCount() {
+            let mut parameter: ParameterInfo = std::mem::zeroed();
+            if controller.getParameterInfo(index, &mut parameter) != kResultOk
+                || parameter.flags & ParameterInfo_::ParameterFlags_::kIsProgramChange == 0
+            {
+                continue;
+            }
+            let Some((_, list_id)) = unit_lists
+                .iter()
+                .find(|(unit_id, _)| *unit_id == parameter.unitId)
+            else {
+                continue;
+            };
+            let Some((_, program_count)) = list_counts.iter().find(|(id, _)| id == list_id) else {
+                continue;
+            };
+            if *program_count > 0 {
+                table.push(ProgramChangeMapping {
+                    unit_id: parameter.unitId,
+                    param_id: parameter.id,
+                    program_count: *program_count,
+                });
+            }
+        }
+    }
+    table
+}
+
+/// Swap each table in `built` into its place where it is newer than what is there, and return what it
+/// replaced, or the built table itself when it was not newer. A table that was wanted and not
+/// built is marked stale again in `dirty`; a mark a restart left meanwhile is kept, so the
+/// installed table is rebuilt once more. Swaps only, so it neither allocates nor frees.
+fn install_tables(
+    midi_mapping: &mut MidiMappingCache,
+    program_change: &mut Vec<ProgramChangeMapping>,
+    generations: &mut CacheGenerations,
+    dirty: &mut DirtyCaches,
+    mut built: BuiltCaches,
+) -> ReplacedCaches {
+    let mut replaced = CacheTables::default();
+    if built.wanted.midi_mapping {
+        match built.tables.midi_mapping.take() {
+            Some(table) if built.generation > generations.midi_mapping => {
+                generations.midi_mapping = built.generation;
+                replaced.midi_mapping = Some(std::mem::replace(midi_mapping, table));
+            }
+            Some(table) => replaced.midi_mapping = Some(table),
+            None => dirty.midi_mapping = true,
+        }
+    }
+    if built.wanted.program_change {
+        match built.tables.program_change.take() {
+            Some(table) if built.generation > generations.program_change => {
+                generations.program_change = built.generation;
+                replaced.program_change = Some(std::mem::replace(program_change, table));
+            }
+            Some(table) => replaced.program_change = Some(table),
+            None => dirty.program_change = true,
+        }
+    }
+    ReplacedCaches { _tables: replaced }
+}
+
 #[derive(Clone, Copy)]
 struct ProgramChangeMapping {
     unit_id: i32,
@@ -192,6 +409,10 @@ pub struct PluginImpl {
     midi_mapping_cache: MidiMappingCache,
     program_change_cache: Vec<ProgramChangeMapping>,
     dirty_caches: DirtyCaches,
+    cache_generations: CacheGenerations,
+    // Set by `defer_cache_rebuilds`: a control-thread entry leaves stale tables for
+    // `take_cache_rebuild` rather than rebuilding them under the caller's lock.
+    defer_cache_rebuilds: bool,
     unit_cache: Mutex<Option<Vec<crate::plugin::PluginUnit>>>,
 
     // Host data structures
@@ -1092,6 +1313,9 @@ impl PluginImpl {
         }
         self.adopt_stale_units();
         self.drain_deferred_controller_sync();
+        if self.defer_cache_rebuilds {
+            return;
+        }
         if std::mem::take(&mut self.dirty_caches.midi_mapping) {
             self.refresh_midi_mapping_cache();
         }
@@ -1119,91 +1343,51 @@ impl PluginImpl {
         let buses = unsafe {
             midi_mapping_bus_count(self.component.getBusCount(kEvent as i32, kInput as i32))
         };
-        let mut cache = MidiMappingCache {
-            buses,
-            assignments: vec![None; buses * MIDI_CHANNEL_COUNT * MIDI_CONTROLLER_COUNT],
-        };
-        let Some(mapping) = self
-            .controller
-            .as_ref()
-            .and_then(|controller| controller.cast::<IMidiMapping>())
-        else {
-            self.midi_mapping_cache = cache;
-            return;
-        };
-        unsafe {
-            for bus in 0..buses {
-                for channel in 0..MIDI_CHANNEL_COUNT {
-                    for controller in 0..MIDI_CONTROLLER_COUNT {
-                        let mut id = 0;
-                        if mapping.getMidiControllerAssignment(
-                            bus as i32,
-                            channel as i16,
-                            controller as CtrlNumber,
-                            &mut id,
-                        ) == kResultOk
-                        {
-                            let index = (bus * MIDI_CHANNEL_COUNT + channel)
-                                * MIDI_CONTROLLER_COUNT
-                                + controller;
-                            cache.assignments[index] = Some(id);
-                        }
-                    }
-                }
-            }
-        }
-        self.midi_mapping_cache = cache;
+        self.midi_mapping_cache = unsafe { build_midi_mapping(self.controller.as_ref(), buses) };
+        self.cache_generations.midi_mapping = self.cache_generations.issue();
     }
 
     fn refresh_program_change_cache(&mut self) {
-        self.program_change_cache.clear();
-        let Some(controller) = self.controller.as_ref() else {
-            return;
-        };
-        let Some(unit_info) = controller.cast::<IUnitInfo>() else {
-            return;
-        };
-        unsafe {
-            let mut unit_lists = Vec::new();
-            for index in 0..unit_info.getUnitCount() {
-                let mut unit: UnitInfo = std::mem::zeroed();
-                if unit_info.getUnitInfo(index, &mut unit) == kResultOk {
-                    unit_lists.push((unit.id, unit.programListId));
-                }
-            }
-            let mut list_counts = Vec::new();
-            for index in 0..unit_info.getProgramListCount() {
-                let mut list: ProgramListInfo = std::mem::zeroed();
-                if unit_info.getProgramListInfo(index, &mut list) == kResultOk {
-                    list_counts.push((list.id, list.programCount));
-                }
-            }
-            for index in 0..controller.getParameterCount() {
-                let mut parameter: ParameterInfo = std::mem::zeroed();
-                if controller.getParameterInfo(index, &mut parameter) != kResultOk
-                    || parameter.flags & ParameterInfo_::ParameterFlags_::kIsProgramChange == 0
-                {
-                    continue;
-                }
-                let Some((_, list_id)) = unit_lists
-                    .iter()
-                    .find(|(unit_id, _)| *unit_id == parameter.unitId)
-                else {
-                    continue;
-                };
-                let Some((_, program_count)) = list_counts.iter().find(|(id, _)| id == list_id)
-                else {
-                    continue;
-                };
-                if *program_count > 0 {
-                    self.program_change_cache.push(ProgramChangeMapping {
-                        unit_id: parameter.unitId,
-                        param_id: parameter.id,
-                        program_count: *program_count,
-                    });
-                }
-            }
+        self.program_change_cache = unsafe { build_program_change(self.controller.as_ref()) };
+        self.cache_generations.program_change = self.cache_generations.issue();
+    }
+
+    /// Take the stale tables for a rebuild off the caller's lock, adopting first any stale mark
+    /// a host-request drain left. `None` when nothing is stale or off the control thread. The
+    /// bus count is read here, since the component is the `Plugin`'s.
+    fn take_stale_tables(&mut self) -> Option<CacheRebuild> {
+        if thread::current().id() != self.control_thread {
+            return None;
         }
+        self.adopt_stale_units();
+        let dirty = std::mem::take(&mut self.dirty_caches);
+        if !dirty.midi_mapping && !dirty.program_change {
+            return None;
+        }
+        let midi_buses = dirty.midi_mapping.then(|| unsafe {
+            midi_mapping_bus_count(self.component.getBusCount(kEvent as i32, kInput as i32))
+        });
+        Some(CacheRebuild {
+            shared: Arc::clone(&self.control),
+            generation: self.cache_generations.issue(),
+            midi_buses,
+            program_change: dirty.program_change,
+        })
+    }
+
+    /// Install tables a rebuild of this plugin built; see `install_tables`. Tables built for
+    /// another plugin are handed back untouched.
+    fn install_built_tables(&mut self, built: BuiltCaches) -> ReplacedCaches {
+        if !Arc::ptr_eq(&built.shared, &self.control) {
+            return built.into();
+        }
+        install_tables(
+            &mut self.midi_mapping_cache,
+            &mut self.program_change_cache,
+            &mut self.cache_generations,
+            &mut self.dirty_caches,
+            built,
+        )
     }
 
     fn cached_program_change(&self, unit_id: i32) -> Option<ProgramChangeMapping> {
@@ -1536,6 +1720,8 @@ impl PluginImpl {
                 midi_mapping_cache: MidiMappingCache::default(),
                 program_change_cache: Vec::new(),
                 dirty_caches: DirtyCaches::default(),
+                cache_generations: CacheGenerations::default(),
+                defer_cache_rebuilds: false,
                 unit_cache: Mutex::new(None),
                 process_data: None,
                 component_handler: Some(component_handler),
@@ -3448,6 +3634,18 @@ impl PluginInternal for PluginImpl {
         }
         self.service_control_thread_caches();
         flags
+    }
+
+    fn defer_cache_rebuilds(&mut self) {
+        self.defer_cache_rebuilds = true;
+    }
+
+    fn take_cache_rebuild(&mut self) -> Option<CacheRebuild> {
+        self.take_stale_tables()
+    }
+
+    fn install_caches(&mut self, built: BuiltCaches) -> ReplacedCaches {
+        self.install_built_tables(built)
     }
 
     fn service_host_requests(&mut self) -> Result<crate::plugin::RestartFlags> {
@@ -5651,6 +5849,134 @@ mod midi_mapping_cache_tests {
         assert_eq!(midi_mapping_bus_count(0), 0);
         assert_eq!(midi_mapping_bus_count(1), 1);
         assert_eq!(midi_mapping_bus_count(i32::MAX), MAX_MIDI_MAPPING_BUSES);
+    }
+
+    fn shared() -> Arc<ControlShared> {
+        Arc::new(ControlShared {
+            controller: Mutex::new(None),
+            deferred: Arc::new(ArrayQueue::new(4)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            progress: create_host_application().progress_queue(),
+            spare: Mutex::new(Vec::new()),
+            units_stale: AtomicBool::new(false),
+            control_thread: thread::current().id(),
+        })
+    }
+
+    fn rebuild(shared: &Arc<ControlShared>, generation: u64, buses: usize) -> CacheRebuild {
+        CacheRebuild {
+            shared: Arc::clone(shared),
+            generation,
+            midi_buses: Some(buses),
+            program_change: true,
+        }
+    }
+
+    /// A rebuild built on the control thread is swapped in, and the install hands the old
+    /// tables back for the caller to drop after its lock rather than freeing them under it.
+    /// Breaks by an install that drops the built tables, frees the old ones itself, or clears a
+    /// stale mark a restart left while the tables were built.
+    #[test]
+    fn an_install_swaps_the_built_tables_in_and_hands_the_old_ones_back() {
+        let shared = shared();
+        let mut midi = MidiMappingCache::default();
+        let mut programs = vec![ProgramChangeMapping {
+            unit_id: 0,
+            param_id: 7,
+            program_count: 2,
+        }];
+        let mut generations = CacheGenerations::default();
+        let built = rebuild(&shared, generations.issue(), 2).build();
+        // A restart marked the map stale again while it was built.
+        let mut dirty = DirtyCaches {
+            midi_mapping: true,
+            program_change: false,
+        };
+        let replaced = install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            &mut dirty,
+            built,
+        );
+        assert_eq!(midi.buses, 2, "the built map was not installed");
+        assert_eq!(
+            midi.assignments.len(),
+            2 * MIDI_CHANNEL_COUNT * MIDI_CONTROLLER_COUNT
+        );
+        assert!(
+            programs.is_empty(),
+            "the built program table was not installed"
+        );
+        assert_eq!(
+            replaced._tables.program_change.as_deref().map(<[_]>::len),
+            Some(1),
+            "the old program table was not handed back"
+        );
+        assert_eq!(
+            replaced._tables.midi_mapping.as_ref().map(|m| m.buses),
+            Some(0),
+            "the old map was not handed back"
+        );
+        assert!(
+            dirty.midi_mapping,
+            "the install cleared a mark left meanwhile"
+        );
+        assert!(!dirty.program_change);
+    }
+
+    /// A rebuild finished after a newer one was installed is handed back, not installed, and a
+    /// rebuild off the control thread builds nothing and leaves both tables stale. Breaks by an
+    /// install that ignores the generation, or one that forgets a table it could not build.
+    #[test]
+    fn an_older_or_unbuilt_rebuild_installs_nothing() {
+        let shared = shared();
+        let mut midi = MidiMappingCache::default();
+        let mut programs = Vec::new();
+        let mut generations = CacheGenerations::default();
+        let older = rebuild(&shared, generations.issue(), 1).build();
+        let newer = rebuild(&shared, generations.issue(), 3).build();
+        let mut dirty = DirtyCaches::default();
+        drop(install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            &mut dirty,
+            newer,
+        ));
+        let replaced = install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            &mut dirty,
+            older,
+        );
+        assert_eq!(midi.buses, 3, "an older map replaced a newer one");
+        assert_eq!(replaced._tables.midi_mapping.map(|m| m.buses), Some(1));
+        assert!(!dirty.midi_mapping && !dirty.program_change);
+
+        let off_thread = thread::scope(|s| {
+            s.spawn(|| rebuild(&shared, generations.issue(), 4).build())
+                .join()
+                .unwrap()
+        });
+        assert!(
+            off_thread.tables.midi_mapping.is_none(),
+            "a map was built off the thread"
+        );
+        drop(install_tables(
+            &mut midi,
+            &mut programs,
+            &mut generations,
+            &mut dirty,
+            off_thread,
+        ));
+        assert_eq!(midi.buses, 3);
+        assert!(
+            dirty.midi_mapping && dirty.program_change,
+            "an unbuilt table was not left stale"
+        );
     }
 }
 

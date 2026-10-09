@@ -45,6 +45,13 @@ All notable changes to `vst3-host` are documented here. The format is based on
   to read the editor's size, then create the real one, each under the plugin lock. The window
   now opens at a placeholder size and is fitted to the attached view, which halves how long an
   open holds the lock.
+- **A host can rebuild the MIDI-mapping and program-change tables without holding the
+  `Plugin`.** After `Plugin::defer_cache_rebuilds`, a restart or a request that invalidates
+  them only marks them stale. `Plugin::take_cache_rebuild` takes the stale ones, the returned
+  `CacheRebuild::build` makes the controller calls (the MIDI map alone is `buses × 16 × 130`
+  of them) with the lock released, and `Plugin::install_caches` swaps the tables in and hands
+  the old ones back to drop after the lock. A table that a restart marked stale again while it
+  was built is rebuilt next time; a late build never replaces a newer table.
 
 ### Added
 
