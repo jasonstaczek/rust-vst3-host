@@ -584,6 +584,13 @@ impl CallerAudioBuffers<'_> {
 struct TypedSampleBuffers<T> {
     inputs: Vec<Vec<T>>,
     outputs: Vec<Vec<T>>,
+    /// One block every channel of an inactive input bus points at, never written by the host.
+    /// Read only through those pointers, so it is held and never named.
+    #[allow(dead_code)]
+    input_scratch: Vec<T>,
+    /// One block every channel of an inactive output bus points at; what lands here is discarded.
+    #[allow(dead_code)]
+    output_scratch: Vec<T>,
     input_channel_ptrs: SendChannelPtrs<T>,
     output_channel_ptrs: SendChannelPtrs<T>,
 }
@@ -662,7 +669,7 @@ fn build_typed_sample_buffers<T: Default + Clone>(
         block_size: usize,
         buses: &[AudioBusBuffers],
         active: &[bool],
-    ) -> (Vec<Vec<T>>, SendChannelPtrs<T>) {
+    ) -> (Vec<Vec<T>>, Vec<T>, SendChannelPtrs<T>) {
         let channel_count: usize = buses
             .iter()
             .zip(active.iter().copied().chain(std::iter::repeat(false)))
@@ -670,6 +677,7 @@ fn build_typed_sample_buffers<T: Default + Clone>(
             .map(|(bus, _)| bus.numChannels.max(0) as usize)
             .sum();
         let mut buffers = vec![vec![T::default(); block_size]; channel_count];
+        let mut scratch = vec![T::default(); block_size];
         let mut next_channel = 0usize;
         let mut pointers = Vec::with_capacity(buses.len());
         for (index, bus) in buses.iter().enumerate() {
@@ -681,22 +689,24 @@ fn build_typed_sample_buffers<T: Default + Clone>(
                     next_channel += 1;
                 }
             } else {
-                // VST3 requires the host to supply the channel-buffer *array* for every bus
-                // whether or not the bus is active; only the sample addresses inside it may be
-                // null while a bus is inactive. `numChannels` stays as reported, so a plugin
-                // that walks the array sees the shape it expects.
-                bus_pointers.resize(channels, ptr::null_mut());
+                // An inactive bus keeps its reported `numChannels` and gets a real address for
+                // each channel, all one scratch block: a plugin may clear every bus it declares
+                // whatever its activation (HALion 7 does, into a null address otherwise).
+                bus_pointers.resize(channels, scratch.as_mut_ptr());
             }
             pointers.push(bus_pointers);
         }
-        (buffers, SendChannelPtrs(pointers))
+        (buffers, scratch, SendChannelPtrs(pointers))
     }
 
-    let (inputs, input_channel_ptrs) = side(block_size, input_buses, input_active);
-    let (outputs, output_channel_ptrs) = side(block_size, output_buses, output_active);
+    let (inputs, input_scratch, input_channel_ptrs) = side(block_size, input_buses, input_active);
+    let (outputs, output_scratch, output_channel_ptrs) =
+        side(block_size, output_buses, output_active);
     TypedSampleBuffers {
         inputs,
         outputs,
+        input_scratch,
+        output_scratch,
         input_channel_ptrs,
         output_channel_ptrs,
     }
@@ -2112,12 +2122,16 @@ impl PluginImpl {
                     ProcessingSampleSize::F32 => HostSampleBuffers::F32(TypedSampleBuffers {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
+                        input_scratch: Vec::new(),
+                        output_scratch: Vec::new(),
                         input_channel_ptrs: SendChannelPtrs(Vec::new()),
                         output_channel_ptrs: SendChannelPtrs(Vec::new()),
                     }),
                     ProcessingSampleSize::F64 => HostSampleBuffers::F64(TypedSampleBuffers {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
+                        input_scratch: Vec::new(),
+                        output_scratch: Vec::new(),
                         input_channel_ptrs: SendChannelPtrs(Vec::new()),
                         output_channel_ptrs: SendChannelPtrs(Vec::new()),
                     }),
@@ -5421,15 +5435,20 @@ mod process_buffer_tests {
             .collect()
     }
 
-    /// An inactive bus still gets a full channel-pointer array — the spec requires the array
-    /// itself for every bus and only permits the *addresses* in it to be null. Sample storage is
-    /// allocated for active channels only.
+    /// An inactive bus gets a full channel-pointer array of real addresses, all its side's one
+    /// scratch block, so a plugin that clears every declared bus writes into memory; sample
+    /// storage is allocated for active channels only.
     #[test]
-    fn typed_buffers_give_inactive_buses_an_array_of_null_channel_pointers() {
+    fn typed_buffers_point_inactive_buses_at_one_scratch_block() {
         let inputs = buses(&[2, 1, 4]);
-        let outputs = buses(&[2]);
-        let samples =
-            build_typed_sample_buffers::<f64>(32, &inputs, &[true, false, true], &outputs, &[true]);
+        let outputs = buses(&[2, 2, 2]);
+        let mut samples = build_typed_sample_buffers::<f64>(
+            32,
+            &inputs,
+            &[true, false, true],
+            &outputs,
+            &[true, false],
+        );
 
         assert_eq!(samples.inputs.len(), 6);
         assert_eq!(
@@ -5441,12 +5460,22 @@ mod process_buffer_tests {
                 .collect::<Vec<_>>(),
             [2, 1, 4]
         );
-        assert!(samples.input_channel_ptrs.0[1].iter().all(|p| p.is_null()));
+        let input_scratch = samples.input_scratch.as_mut_ptr();
+        assert!(samples.input_channel_ptrs.0[1]
+            .iter()
+            .all(|&p| p == input_scratch));
         assert!(samples.input_channel_ptrs.0[0]
             .iter()
             .chain(&samples.input_channel_ptrs.0[2])
-            .all(|p| !p.is_null()));
+            .all(|&p| !p.is_null() && p != input_scratch));
         assert_eq!(samples.outputs.len(), 2);
+        assert_eq!(samples.output_scratch.len(), 32);
+        let output_scratch = samples.output_scratch.as_mut_ptr();
+        assert!(samples.output_channel_ptrs.0[1]
+            .iter()
+            .chain(&samples.output_channel_ptrs.0[2])
+            .all(|&p| p == output_scratch));
+        assert_ne!(output_scratch, input_scratch);
     }
 
     #[test]
