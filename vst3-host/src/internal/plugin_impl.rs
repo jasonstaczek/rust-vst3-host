@@ -4725,17 +4725,28 @@ impl PluginImpl {
         let read_and_activate = |media: i32, direction: i32| -> Result<Vec<bool>> {
             let count = component.getBusCount(media, direction);
             let mut states = Vec::with_capacity(count.max(0) as usize);
+            let mut main_seen = false;
             for index in 0..count {
                 let mut info: BusInfo = std::mem::zeroed();
-                let active = component.getBusInfo(media, direction, index, &mut info) == kResultOk
-                    && (info.flags & BusInfo_::BusFlags_::kDefaultActive as u32) != 0;
+                let known = component.getBusInfo(media, direction, index, &mut info) == kResultOk;
+                let default_active =
+                    known && (info.flags & BusInfo_::BusFlags_::kDefaultActive as u32) != 0;
+                // The first main bus is activated whatever its flags: HALion 7 leaves
+                // kDefaultActive off every output and plays into bus 0, so honouring the flag
+                // alone hears nothing (akx DF-B102). One the plugin refuses stays inactive.
+                let main = known && info.busType == BusTypes_::kMain as BusType;
+                let mut active = default_active || (main && !main_seen);
+                main_seen |= main;
                 if active {
                     let result = component.activateBus(media, direction, index, 1);
                     if result != kResultOk {
-                        return Err(Error::InterfaceError(format!(
-                            "activateBus failed for default-active bus \
-                             ({media}, {direction}, {index}): {result:#x}"
-                        )));
+                        if default_active {
+                            return Err(Error::InterfaceError(format!(
+                                "activateBus failed for default-active bus \
+                                 ({media}, {direction}, {index}): {result:#x}"
+                            )));
+                        }
+                        active = false;
                     }
                 }
                 states.push(active);
