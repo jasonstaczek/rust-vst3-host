@@ -1122,6 +1122,49 @@ fn view_rect_size(rect: &ViewRect) -> Result<(i32, i32)> {
     Ok((width, height))
 }
 
+/// The component's state and, unless `controller` is `None`, the controller's, each read by
+/// `getState` into a memory stream. A single-component plugin passes no controller: its
+/// controller is the component, whose blob would come twice.
+unsafe fn read_state(
+    component: &ComPtr<IComponent>,
+    controller: Option<&ComPtr<IEditController>>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let component_stream = create_memory_stream_with_metadata(None, StreamStateType::Project);
+    let component_ptr = component_stream
+        .to_com_ptr::<IBStream>()
+        .ok_or_else(|| Error::InterfaceError("Failed to create component state stream".into()))?;
+    let result = component.getState(component_ptr.as_ptr());
+    if result != kResultOk {
+        return Err(Error::Other(format!(
+            "Plugin does not provide state (getState: {result:#x})"
+        )));
+    }
+
+    // A single-component plugin's "controller" is the component itself, so asking it for
+    // its state returns the blob above a second time: the envelope would carry the same
+    // bytes twice, the combined size cap would effectively halve, and `load_state` would
+    // apply `setState` twice. `load_state` has the matching guard.
+    let controller = if let Some(controller) = controller {
+        let stream = create_memory_stream_with_metadata(None, StreamStateType::Project);
+        let stream_ptr = stream.to_com_ptr::<IBStream>().ok_or_else(|| {
+            Error::InterfaceError("Failed to create controller state stream".into())
+        })?;
+        let result = controller.getState(stream_ptr.as_ptr());
+        if result == kResultOk {
+            Some(stream.to_vec())
+        } else if result == kNotImplemented || result == kResultFalse {
+            None
+        } else {
+            return Err(Error::Other(format!(
+                "Failed to save controller state (getState: {result:#x})"
+            )));
+        }
+    } else {
+        None
+    };
+    Ok((component_stream.to_vec(), controller))
+}
+
 /// Fit an open view to `width` x `height` as far as it allows, returning the size it took.
 unsafe fn resize_view(view: &ComPtr<IPlugView>, width: i32, height: i32) -> Result<(i32, i32)> {
     if view.canResize() != kResultTrue {
@@ -1810,6 +1853,8 @@ impl PluginImpl {
                     run_loop: run_loop.clone(),
                     has_gui: updated_info.has_gui,
                 },
+                class_uid: updated_info.uid.clone(),
+                single_component,
             });
 
             let mut plugin = Self {
@@ -4337,49 +4382,12 @@ impl PluginInternal for PluginImpl {
 
     fn save_state(&self) -> Result<Vec<u8>> {
         self.drain_deferred_controller_sync();
-        unsafe {
-            let component_stream =
-                create_memory_stream_with_metadata(None, StreamStateType::Project);
-            let component_ptr = component_stream.to_com_ptr::<IBStream>().ok_or_else(|| {
-                Error::InterfaceError("Failed to create component state stream".into())
-            })?;
-            let result = self.component.getState(component_ptr.as_ptr());
-            if result != kResultOk {
-                return Err(Error::Other(format!(
-                    "Plugin does not provide state (getState: {result:#x})"
-                )));
-            }
-
-            // A single-component plugin's "controller" is the component itself, so asking it for
-            // its state returns the blob above a second time: the envelope would carry the same
-            // bytes twice, the combined size cap would effectively halve, and `load_state` would
-            // apply `setState` twice. `load_state` has the matching guard.
-            let controller = if let Some(controller) =
-                self.controller.as_ref().filter(|_| !self.single_component)
-            {
-                let stream = create_memory_stream_with_metadata(None, StreamStateType::Project);
-                let stream_ptr = stream.to_com_ptr::<IBStream>().ok_or_else(|| {
-                    Error::InterfaceError("Failed to create controller state stream".into())
-                })?;
-                let result = controller.getState(stream_ptr.as_ptr());
-                if result == kResultOk {
-                    Some(stream.to_vec())
-                } else if result == kNotImplemented || result == kResultFalse {
-                    None
-                } else {
-                    return Err(Error::Other(format!(
-                        "Failed to save controller state (getState: {result:#x})"
-                    )));
-                }
-            } else {
-                None
-            };
-
-            encode_state_snapshot(&StateSnapshot {
-                component: component_stream.to_vec(),
-                controller,
-            })
-        }
+        let controller = self.controller.as_ref().filter(|_| !self.single_component);
+        let (component, controller) = unsafe { read_state(&self.component, controller)? };
+        encode_state_snapshot(&StateSnapshot {
+            component,
+            controller,
+        })
     }
 
     fn load_state_with_context(&mut self, data: &[u8], context: &StateContext) -> Result<()> {
@@ -4757,6 +4765,10 @@ pub(crate) struct ControlShared {
     generation: AtomicU64,
     control_thread: ThreadId,
     pub(crate) editor: EditorShared,
+    // Read for a state save through a link: the plugin's class id, and whether its controller
+    // is its component.
+    class_uid: String,
+    single_component: bool,
 }
 
 /// The plugin's editor view and what it is built with, behind a lock the audio thread never
@@ -4961,6 +4973,33 @@ impl ControlShared {
             reg.timers.clear();
         }
         close_error.map_or(Ok(()), Err)
+    }
+
+    /// The plugin's class id and its state, the component's and the controller's, read
+    /// without the `Plugin`: VST 3 lets `getState` run on the UI thread beside `process`.
+    /// Applies the controller's parked values first, as `PluginImpl::save_state` does.
+    pub(crate) fn state(&self) -> Result<(&str, StateSnapshot)> {
+        self.service();
+        let component = self
+            .component
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .ok_or_else(|| Error::Other("the plugin is gone".to_string()))?;
+        let controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .filter(|_| !self.single_component);
+        let (component, controller) = unsafe { read_state(&component, controller.as_ref())? };
+        Ok((
+            &self.class_uid,
+            StateSnapshot {
+                component,
+                controller,
+            },
+        ))
     }
 
     /// The open view's size, or `None` when no editor is open.
@@ -6137,6 +6176,8 @@ mod midi_mapping_cache_tests {
             generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
             editor: EditorShared::unattached(),
+            class_uid: String::new(),
+            single_component: false,
         })
     }
 
@@ -6524,6 +6565,8 @@ mod editor_edit_drain_tests {
             generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
             editor: EditorShared::unattached(),
+            class_uid: String::new(),
+            single_component: false,
         }
     }
 

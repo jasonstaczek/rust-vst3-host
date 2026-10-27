@@ -454,6 +454,18 @@ impl ControlLink {
         self.shared.editor.take_resize_request()
     }
 
+    /// Write the plugin's state to `path` as a `.vstpreset`, as [`Plugin::save_vstpreset`]
+    /// does, without the `Plugin`: VST 3 lets `getState` run on the UI thread beside
+    /// `process`, so an audio thread holding the `Plugin` never waits on a save. On the thread
+    /// that loaded the plugin. A load still goes through the `Plugin`, since `setState` stops
+    /// processing first.
+    pub fn save_vstpreset<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
+        let (uid, state) = self.shared.state()?;
+        let bytes = vstpreset::build(uid, &state.component, state.controller.as_deref())?;
+        std::fs::write(path, bytes).map_err(|e| Error::Other(format!("write vstpreset: {e}")))?;
+        Ok(())
+    }
+
     /// Offer the open editor a content scale, kept for the next open, as
     /// [`Plugin::set_editor_scale_factor`] does, without the `Plugin`.
     pub fn set_editor_scale_factor(&self, factor: f32) -> Result<bool> {
