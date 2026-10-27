@@ -422,6 +422,43 @@ impl ControlLink {
     pub fn take_cache_rebuild(&self) -> Option<CacheRebuild> {
         self.shared.take_cache_rebuild()
     }
+
+    /// Whether the plugin has an editor, without the `Plugin`: its load-time answer, an open
+    /// editor, or else a probe view built and released. On the thread that loaded the plugin.
+    pub fn has_editor(&self) -> bool {
+        self.shared.has_editor()
+    }
+
+    /// Build the editor's view and attach it to `parent`, as [`Plugin::open_editor`] does, but
+    /// without the `Plugin`: VST 3 runs the view on the UI thread beside `process`, so the
+    /// audio thread's lock is not held across `createView` or `attached`. On the thread that
+    /// loaded the plugin. Refuses an editor already open, by this link or the `Plugin`.
+    pub fn open_editor(&self, parent: WindowHandle) -> Result<()> {
+        self.shared.open_editor(parent.0)
+    }
+
+    /// Detach and release the editor's view, as [`Plugin::close_editor`] does, without the
+    /// `Plugin`. Nothing when no editor is open.
+    pub fn close_editor(&self) -> Result<()> {
+        self.shared.close_editor()
+    }
+
+    /// The open editor's size in pixels, or `None` when no editor is open.
+    pub fn editor_size(&self) -> Option<Result<(i32, i32)>> {
+        self.shared.open_editor_size()
+    }
+
+    /// Take the size the editor last asked its window for, as
+    /// [`Plugin::take_editor_resize_request`] does, without the `Plugin`.
+    pub fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
+        self.shared.editor.take_resize_request()
+    }
+
+    /// Offer the open editor a content scale, kept for the next open, as
+    /// [`Plugin::set_editor_scale_factor`] does, without the `Plugin`.
+    pub fn set_editor_scale_factor(&self, factor: f32) -> Result<bool> {
+        self.shared.set_editor_scale_factor(factor)
+    }
 }
 
 /// A single parameter-edit gesture event reported by a plugin's own editor.

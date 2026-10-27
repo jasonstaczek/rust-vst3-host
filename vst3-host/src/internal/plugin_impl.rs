@@ -510,14 +510,7 @@ pub struct PluginImpl {
     // the oldest event is dropped (bounded memory if the host never polls).
     output_events_owned: Arc<ArrayQueue<PluginEvent>>,
 
-    // Plugin view
-    plugin_view: Option<ComPtr<IPlugView>>,
-    editor_scale_factor: f32,
-
-    // Editor resize plumbing: the IPlugFrame handed to the plugin's view, and the slot it
-    // writes requested sizes into (drained via take_editor_resize_request).
-    plug_frame: ComWrapper<HostPlugFrame>,
-    editor_resize: Arc<Mutex<Option<(i32, i32)>>>,
+    // The plugin's view lives in `control.editor`, where a link reaches it without the `Plugin`.
     // Linux IRunLoop registrations from the plugin's editor (fd handlers +
     // timers), serviced on the host UI thread via `service_run_loop`.
     #[cfg(target_os = "linux")]
@@ -1127,6 +1120,66 @@ fn view_rect_size(rect: &ViewRect) -> Result<(i32, i32)> {
         .filter(|height| *height > 0)
         .ok_or_else(|| Error::Other("plugin editor returned an invalid height".to_string()))?;
     Ok((width, height))
+}
+
+/// Fit an open view to `width` x `height` as far as it allows, returning the size it took.
+unsafe fn resize_view(view: &ComPtr<IPlugView>, width: i32, height: i32) -> Result<(i32, i32)> {
+    if view.canResize() != kResultTrue {
+        let mut current = ViewRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if view.getSize(&mut current) != kResultOk {
+            return Err(Error::Other(
+                "Plugin editor is fixed-size and its size could not be queried".to_string(),
+            ));
+        }
+        return view_rect_size(&current);
+    }
+
+    let mut requested = ViewRect {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    // The view constrains `requested` in place. `kResultFalse` means it left the rect
+    // alone (nothing to constrain, or it wants a different size than asked for) — a
+    // refusal to adapt, not a broken call — so take whatever rect it ended up with and
+    // only reject result codes that mean the call itself failed.
+    let constraint_result = view.checkSizeConstraint(&mut requested);
+    let constrained = constraint_result == kResultOk
+        || constraint_result == kResultTrue
+        || constraint_result == kResultFalse
+        || constraint_result == kNotImplemented;
+    if !constrained {
+        return Err(Error::Other(format!(
+            "Plugin failed to check the editor size constraint: {constraint_result:#x}"
+        )));
+    }
+    let accepted = view_rect_size(&requested)?;
+
+    // The SDK calls onSize only when the size actually changes; re-sending the current
+    // one makes VSTGUI-based editors rebuild their frame for nothing.
+    let mut current = ViewRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if view.getSize(&mut current) == kResultOk && view_rect_size(&current).ok() == Some(accepted) {
+        return Ok(accepted);
+    }
+
+    let resize_result = view.onSize(&mut requested);
+    if resize_result != kResultOk && resize_result != kResultTrue {
+        return Err(Error::Other(format!(
+            "Plugin rejected editor resize: {resize_result:#x}"
+        )));
+    }
+    Ok(accepted)
 }
 
 /// Offer a content scale factor to an editor view.
@@ -1746,6 +1799,17 @@ impl PluginImpl {
                 stale: AtomicU8::new(0),
                 generation: AtomicU64::new(0),
                 control_thread: thread::current().id(),
+                editor: EditorShared {
+                    view: Mutex::new(EditorView {
+                        view: None,
+                        scale: 1.0,
+                    }),
+                    plug_frame,
+                    editor_resize,
+                    #[cfg(target_os = "linux")]
+                    run_loop: run_loop.clone(),
+                    has_gui: updated_info.has_gui,
+                },
             });
 
             let mut plugin = Self {
@@ -1794,10 +1858,6 @@ impl PluginImpl {
                 output_events,
                 chunk_events: Vec::with_capacity(MAX_QUEUED_EVENTS),
                 output_events_owned: Arc::new(ArrayQueue::new(MAX_OUTPUT_MIDI)),
-                plugin_view: None,
-                editor_scale_factor: 1.0,
-                plug_frame,
-                editor_resize,
                 #[cfg(target_os = "linux")]
                 run_loop,
                 _module: module,
@@ -3275,7 +3335,7 @@ impl PluginInternal for PluginImpl {
 
         // An open editor is proof enough, and probing for a second view while one is attached
         // upsets plugins that assume a single live view.
-        if self.plugin_view.is_some() {
+        if self.control.editor.is_open() {
             return true;
         }
 
@@ -3301,131 +3361,11 @@ impl PluginInternal for PluginImpl {
     }
 
     fn open_editor(&mut self, parent: *mut std::ffi::c_void) -> Result<()> {
-        if self.plugin_view.is_some() {
-            return Err(Error::Other("Editor already open".to_string()));
-        }
-        if parent.is_null() {
-            return Err(Error::Other(
-                "editor parent window handle is null".to_string(),
-            ));
-        }
-
-        if let Some(ref controller) = self.controller {
-            unsafe {
-                // Create editor view
-                let view_type = c"editor".as_ptr();
-                let view_ptr = controller.createView(view_type);
-                if view_ptr.is_null() {
-                    return Err(Error::Other("Failed to create editor view".to_string()));
-                }
-
-                let view = ComPtr::<IPlugView>::from_raw(view_ptr)
-                    .ok_or_else(|| Error::Other("Failed to wrap view".to_string()))?;
-
-                // Get view size
-                let mut view_rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 400,
-                    bottom: 300,
-                };
-
-                if view.getSize(&mut view_rect) != kResultOk {
-                    return Err(Error::Other("Failed to get view size".to_string()));
-                }
-                view_rect_size(&view_rect)?;
-
-                // Hand the plugin an IPlugFrame (before attach, per the SDK) so it can
-                // request host-side resizes; requests land in `editor_resize`.
-                let frame = self.plug_frame.to_com_ptr::<IPlugFrame>().ok_or_else(|| {
-                    Error::Other("Failed to create editor plug frame".to_string())
-                })?;
-                let frame_result = view.setFrame(frame.as_ptr());
-                if frame_result != kResultOk && frame_result != kResultTrue {
-                    return Err(Error::Other(format!(
-                        "Plugin rejected editor plug frame: {frame_result:#x}"
-                    )));
-                }
-
-                // Offer the current scale factor, but never let the answer decide whether the
-                // editor opens: a view that declines simply renders at its own scale.
-                let _ = set_view_scale_factor(&view, self.editor_scale_factor);
-
-                // Platform-specific attachment
-                #[cfg(target_os = "macos")]
-                let platform_type = kPlatformTypeNSView;
-                #[cfg(target_os = "windows")]
-                let platform_type = kPlatformTypeHWND;
-                #[cfg(target_os = "linux")]
-                let platform_type = kPlatformTypeX11EmbedWindowID;
-                #[cfg(target_os = "android")]
-                {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other(
-                        "embedded VST3 editors are not supported on Android".to_string(),
-                    ));
-                }
-
-                // Check platform support
-                #[cfg(not(target_os = "android"))]
-                if view.isPlatformTypeSupported(platform_type) != kResultOk {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other("Platform type not supported".to_string()));
-                }
-
-                // Attach to parent window
-                #[cfg(not(target_os = "android"))]
-                let attach_result = view.attached(parent, platform_type);
-                #[cfg(not(target_os = "android"))]
-                if attach_result != kResultOk {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other(format!(
-                        "Failed to attach view: {:#x}",
-                        attach_result
-                    )));
-                }
-
-                #[cfg(not(target_os = "android"))]
-                {
-                    self.plugin_view = Some(view);
-                    Ok(())
-                }
-            }
-        } else {
-            Err(Error::Other("No controller available".to_string()))
-        }
+        self.control.open_editor(parent)
     }
 
     fn close_editor(&mut self) -> Result<()> {
-        let mut close_error = None;
-        if let Some(view) = self.plugin_view.take() {
-            unsafe {
-                let removed_result = view.removed();
-                // Break the view -> host-frame reference before releasing the view. The frame
-                // intentionally never retains the view, so this also avoids a COM retain cycle.
-                let frame_result = view.setFrame(std::ptr::null_mut());
-                if removed_result != kResultOk && removed_result != kResultTrue {
-                    close_error = Some(Error::Other(format!(
-                        "Failed to detach editor view: {removed_result:#x}"
-                    )));
-                } else if frame_result != kResultOk && frame_result != kResultTrue {
-                    close_error = Some(Error::Other(format!(
-                        "Failed to clear editor plug frame: {frame_result:#x}"
-                    )));
-                }
-            }
-        }
-        // Drop any run-loop registrations the editor left behind. A well-behaved plugin
-        // unregisters its own handlers and timers during `removed()`, but one that doesn't would
-        // otherwise leave live ComPtrs into a view that no longer exists — and since
-        // `Plugin::service_run_loop` is public with no editor-open guard, a host driving it from
-        // its frame loop would then dispatch straight into the removed view.
-        #[cfg(target_os = "linux")]
-        if let Ok(mut reg) = self.run_loop.lock() {
-            reg.handlers.clear();
-            reg.timers.clear();
-        }
-        close_error.map_or(Ok(()), Err)
+        self.control.close_editor()
     }
 
     #[cfg(target_os = "linux")]
@@ -3477,19 +3417,8 @@ impl PluginInternal for PluginImpl {
     }
 
     fn get_editor_size(&self) -> Result<(i32, i32)> {
-        if let Some(view) = self.plugin_view.as_ref() {
-            unsafe {
-                let mut view_rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                if view.getSize(&mut view_rect) != kResultOk {
-                    return Err(Error::Other("Failed to query open editor size".to_string()));
-                }
-                return view_rect_size(&view_rect);
-            }
+        if let Some(size) = self.control.open_editor_size() {
+            return size;
         }
 
         if let Some(ref controller) = self.controller {
@@ -3532,8 +3461,12 @@ impl PluginInternal for PluginImpl {
 
     fn editor_can_resize(&self) -> bool {
         unsafe {
-            if let Some(view) = self.plugin_view.as_ref() {
-                return view.canResize() == kResultTrue;
+            if let Some(can) = self
+                .control
+                .editor
+                .with_view(|view| view.canResize() == kResultTrue)
+            {
+                return can;
             }
 
             let Some(controller) = self.controller.as_ref() else {
@@ -3553,71 +3486,10 @@ impl PluginInternal for PluginImpl {
                 "editor dimensions must be greater than zero".to_string(),
             ));
         }
-        let view = self
-            .plugin_view
-            .as_ref()
-            .ok_or_else(|| Error::Other("Plugin editor is not open".to_string()))?;
-
-        unsafe {
-            if view.canResize() != kResultTrue {
-                let mut current = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                if view.getSize(&mut current) != kResultOk {
-                    return Err(Error::Other(
-                        "Plugin editor is fixed-size and its size could not be queried".to_string(),
-                    ));
-                }
-                return view_rect_size(&current);
-            }
-
-            let mut requested = ViewRect {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
-            // The view constrains `requested` in place. `kResultFalse` means it left the rect
-            // alone (nothing to constrain, or it wants a different size than asked for) — a
-            // refusal to adapt, not a broken call — so take whatever rect it ended up with and
-            // only reject result codes that mean the call itself failed.
-            let constraint_result = view.checkSizeConstraint(&mut requested);
-            let constrained = constraint_result == kResultOk
-                || constraint_result == kResultTrue
-                || constraint_result == kResultFalse
-                || constraint_result == kNotImplemented;
-            if !constrained {
-                return Err(Error::Other(format!(
-                    "Plugin failed to check the editor size constraint: {constraint_result:#x}"
-                )));
-            }
-            let accepted = view_rect_size(&requested)?;
-
-            // The SDK calls onSize only when the size actually changes; re-sending the current
-            // one makes VSTGUI-based editors rebuild their frame for nothing.
-            let mut current = ViewRect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            if view.getSize(&mut current) == kResultOk
-                && view_rect_size(&current).ok() == Some(accepted)
-            {
-                return Ok(accepted);
-            }
-
-            let resize_result = view.onSize(&mut requested);
-            if resize_result != kResultOk && resize_result != kResultTrue {
-                return Err(Error::Other(format!(
-                    "Plugin rejected editor resize: {resize_result:#x}"
-                )));
-            }
-            Ok(accepted)
-        }
+        self.control
+            .editor
+            .with_view(|view| unsafe { resize_view(view, width, height) })
+            .ok_or_else(|| Error::Other("Plugin editor is not open".to_string()))?
     }
 
     fn set_editor_scale_factor(&mut self, factor: f32) -> Result<bool> {
@@ -3626,12 +3498,7 @@ impl PluginInternal for PluginImpl {
                 "editor scale factor must be finite and greater than zero".to_string(),
             ));
         }
-        let supported = match self.plugin_view.as_ref() {
-            Some(view) => unsafe { set_view_scale_factor(view, factor)? },
-            None => false,
-        };
-        self.editor_scale_factor = factor;
-        Ok(supported)
+        self.control.set_editor_scale_factor(factor)
     }
 
     fn get_parameter_changes(&self) -> Vec<(u32, f64)> {
@@ -3790,7 +3657,7 @@ impl PluginInternal for PluginImpl {
     }
 
     fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
-        self.editor_resize.lock().ok().and_then(|mut s| s.take())
+        self.control.editor.take_resize_request()
     }
 
     fn latency_samples(&self) -> u32 {
@@ -4889,9 +4756,265 @@ pub(crate) struct ControlShared {
     // The last generation a rebuild or an in-call refresh was issued.
     generation: AtomicU64,
     control_thread: ThreadId,
+    pub(crate) editor: EditorShared,
+}
+
+/// The plugin's editor view and what it is built with, behind a lock the audio thread never
+/// takes, so the `Plugin` and a [`crate::plugin::ControlLink`] open and close it alike and
+/// neither holds the `Plugin` across the view's calls.
+pub(crate) struct EditorShared {
+    view: Mutex<EditorView>,
+    // The IPlugFrame handed to the view, and the slot it writes requested sizes into.
+    plug_frame: ComWrapper<HostPlugFrame>,
+    editor_resize: Arc<Mutex<Option<(i32, i32)>>>,
+    #[cfg(target_os = "linux")]
+    run_loop: Arc<Mutex<RunLoopRegistry>>,
+    has_gui: bool,
+}
+
+struct EditorView {
+    view: Option<ComPtr<IPlugView>>,
+    scale: f32,
+}
+
+impl EditorShared {
+    /// An editor with no view and a frame of its own, for a test's `ControlShared`.
+    #[cfg(test)]
+    fn unattached() -> Self {
+        let editor_resize = Arc::new(Mutex::new(None));
+        #[cfg(target_os = "linux")]
+        let run_loop = Arc::new(Mutex::new(RunLoopRegistry::new()));
+        Self {
+            view: Mutex::new(EditorView {
+                view: None,
+                scale: 1.0,
+            }),
+            #[cfg(target_os = "linux")]
+            plug_frame: create_host_plug_frame(editor_resize.clone(), run_loop.clone()),
+            #[cfg(not(target_os = "linux"))]
+            plug_frame: create_host_plug_frame(editor_resize.clone()),
+            editor_resize,
+            #[cfg(target_os = "linux")]
+            run_loop,
+            has_gui: false,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, EditorView> {
+        self.view
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.lock().view.is_some()
+    }
+
+    /// `call` on the open view, or `None` when no editor is open.
+    pub(crate) fn with_view<T>(&self, call: impl FnOnce(&ComPtr<IPlugView>) -> T) -> Option<T> {
+        self.lock().view.as_ref().map(call)
+    }
+
+    pub(crate) fn take_resize_request(&self) -> Option<(i32, i32)> {
+        self.editor_resize.lock().ok().and_then(|mut s| s.take())
+    }
 }
 
 impl ControlShared {
+    /// Build the editor's view and attach it to `parent`, holding only the editor's lock.
+    pub(crate) fn open_editor(&self, parent: *mut std::ffi::c_void) -> Result<()> {
+        let mut editor = self.editor.lock();
+        if editor.view.is_some() {
+            return Err(Error::Other("Editor already open".to_string()));
+        }
+        if parent.is_null() {
+            return Err(Error::Other(
+                "editor parent window handle is null".to_string(),
+            ));
+        }
+
+        // A clone, so the controller's lock is not held across the plugin's view calls.
+        let controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(ref controller) = controller {
+            unsafe {
+                // Create editor view
+                let view_type = c"editor".as_ptr();
+                let view_ptr = controller.createView(view_type);
+                if view_ptr.is_null() {
+                    return Err(Error::Other("Failed to create editor view".to_string()));
+                }
+
+                let view = ComPtr::<IPlugView>::from_raw(view_ptr)
+                    .ok_or_else(|| Error::Other("Failed to wrap view".to_string()))?;
+
+                // Get view size
+                let mut view_rect = ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: 400,
+                    bottom: 300,
+                };
+
+                if view.getSize(&mut view_rect) != kResultOk {
+                    return Err(Error::Other("Failed to get view size".to_string()));
+                }
+                view_rect_size(&view_rect)?;
+
+                // Hand the plugin an IPlugFrame (before attach, per the SDK) so it can
+                // request host-side resizes; requests land in `editor_resize`.
+                let frame = self
+                    .editor
+                    .plug_frame
+                    .to_com_ptr::<IPlugFrame>()
+                    .ok_or_else(|| {
+                        Error::Other("Failed to create editor plug frame".to_string())
+                    })?;
+                let frame_result = view.setFrame(frame.as_ptr());
+                if frame_result != kResultOk && frame_result != kResultTrue {
+                    return Err(Error::Other(format!(
+                        "Plugin rejected editor plug frame: {frame_result:#x}"
+                    )));
+                }
+
+                // Offer the current scale factor, but never let the answer decide whether the
+                // editor opens: a view that declines simply renders at its own scale.
+                let _ = set_view_scale_factor(&view, editor.scale);
+
+                // Platform-specific attachment
+                #[cfg(target_os = "macos")]
+                let platform_type = kPlatformTypeNSView;
+                #[cfg(target_os = "windows")]
+                let platform_type = kPlatformTypeHWND;
+                #[cfg(target_os = "linux")]
+                let platform_type = kPlatformTypeX11EmbedWindowID;
+                #[cfg(target_os = "android")]
+                {
+                    view.setFrame(std::ptr::null_mut());
+                    return Err(Error::Other(
+                        "embedded VST3 editors are not supported on Android".to_string(),
+                    ));
+                }
+
+                // Check platform support
+                #[cfg(not(target_os = "android"))]
+                if view.isPlatformTypeSupported(platform_type) != kResultOk {
+                    view.setFrame(std::ptr::null_mut());
+                    return Err(Error::Other("Platform type not supported".to_string()));
+                }
+
+                // Attach to parent window
+                #[cfg(not(target_os = "android"))]
+                let attach_result = view.attached(parent, platform_type);
+                #[cfg(not(target_os = "android"))]
+                if attach_result != kResultOk {
+                    view.setFrame(std::ptr::null_mut());
+                    return Err(Error::Other(format!(
+                        "Failed to attach view: {:#x}",
+                        attach_result
+                    )));
+                }
+
+                #[cfg(not(target_os = "android"))]
+                {
+                    editor.view = Some(view);
+                    Ok(())
+                }
+            }
+        } else {
+            Err(Error::Other("No controller available".to_string()))
+        }
+    }
+
+    /// Detach and release the editor's view, holding only the editor's lock.
+    pub(crate) fn close_editor(&self) -> Result<()> {
+        let mut editor = self.editor.lock();
+        let mut close_error = None;
+        if let Some(view) = editor.view.take() {
+            unsafe {
+                let removed_result = view.removed();
+                // Break the view -> host-frame reference before releasing the view. The frame
+                // intentionally never retains the view, so this also avoids a COM retain cycle.
+                let frame_result = view.setFrame(std::ptr::null_mut());
+                if removed_result != kResultOk && removed_result != kResultTrue {
+                    close_error = Some(Error::Other(format!(
+                        "Failed to detach editor view: {removed_result:#x}"
+                    )));
+                } else if frame_result != kResultOk && frame_result != kResultTrue {
+                    close_error = Some(Error::Other(format!(
+                        "Failed to clear editor plug frame: {frame_result:#x}"
+                    )));
+                }
+            }
+        }
+        // Drop any run-loop registrations the editor left behind. A well-behaved plugin
+        // unregisters its own handlers and timers during `removed()`, but one that doesn't would
+        // otherwise leave live ComPtrs into a view that no longer exists — and since
+        // `Plugin::service_run_loop` is public with no editor-open guard, a host driving it from
+        // its frame loop would then dispatch straight into the removed view.
+        #[cfg(target_os = "linux")]
+        if let Ok(mut reg) = self.editor.run_loop.lock() {
+            reg.handlers.clear();
+            reg.timers.clear();
+        }
+        close_error.map_or(Ok(()), Err)
+    }
+
+    /// The open view's size, or `None` when no editor is open.
+    pub(crate) fn open_editor_size(&self) -> Option<Result<(i32, i32)>> {
+        self.editor.with_view(|view| unsafe {
+            let mut view_rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if view.getSize(&mut view_rect) != kResultOk {
+                return Err(Error::Other("Failed to query open editor size".to_string()));
+            }
+            view_rect_size(&view_rect)
+        })
+    }
+
+    /// Offer the open view `factor`, and keep it for the next open.
+    pub(crate) fn set_editor_scale_factor(&self, factor: f32) -> Result<bool> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(Error::Other(
+                "editor scale factor must be finite and greater than zero".to_string(),
+            ));
+        }
+        let mut editor = self.editor.lock();
+        let supported = match editor.view.as_ref() {
+            Some(view) => unsafe { set_view_scale_factor(view, factor)? },
+            None => false,
+        };
+        editor.scale = factor;
+        Ok(supported)
+    }
+
+    /// Whether the plugin has an editor: its load-time answer, an open view, or a probe view
+    /// built and released.
+    pub(crate) fn has_editor(&self) -> bool {
+        if self.editor.has_gui || self.editor.is_open() {
+            return true;
+        }
+        let controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let Some(controller) = controller else {
+            return false;
+        };
+        // Released unattached, so never `removed()`, as `PluginImpl::has_editor`'s probe.
+        unsafe {
+            ComPtr::<IPlugView>::from_raw(controller.createView(c"editor".as_ptr())).is_some()
+        }
+    }
+
     /// Apply the parked values to the controller, oldest first, and return how many. Nothing
     /// off the control thread, where an `IEditController` call does not belong, or once the
     /// plugin is gone.
@@ -6013,6 +6136,7 @@ mod midi_mapping_cache_tests {
             stale: AtomicU8::new(0),
             generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
+            editor: EditorShared::unattached(),
         })
     }
 
@@ -6399,6 +6523,7 @@ mod editor_edit_drain_tests {
             stale: AtomicU8::new(0),
             generation: AtomicU64::new(0),
             control_thread: thread::current().id(),
+            editor: EditorShared::unattached(),
         }
     }
 

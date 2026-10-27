@@ -4,7 +4,7 @@
 //! for VST3 plugin GUIs.
 
 use crate::error::{Error, Result};
-use crate::plugin::Plugin;
+use crate::plugin::{ControlLink, Plugin, WindowHandle};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -125,6 +125,9 @@ struct XcbWindowState {
 /// A plugin window that manages the native window and plugin editor lifecycle
 pub struct PluginWindow {
     plugin: Arc<Mutex<Plugin>>,
+    /// The plugin's control link and name, through which the editor opens, is serviced and
+    /// closes without the `Plugin`'s lock; `None` takes the lock instead.
+    link: Option<(ControlLink, String)>,
     #[cfg(target_os = "macos")]
     native_window: Option<Retained<NSWindow>>,
     /// The view the plugin attached its editor into. Kept so a plugin-initiated resize can
@@ -142,8 +145,17 @@ pub struct PluginWindow {
 impl PluginWindow {
     /// Create a new plugin window for the given plugin
     pub fn new(plugin: Arc<Mutex<Plugin>>) -> Self {
+        Self::with_link(plugin, None)
+    }
+
+    /// A window for `plugin` whose editor goes through `link`, its [`ControlLink`], and is
+    /// titled with the plugin's `name`, so no call the window makes takes the `Plugin`'s lock
+    /// and an audio thread holding that lock never waits on the editor, nor the editor on it.
+    /// `None` is [`Self::new`].
+    pub fn with_link(plugin: Arc<Mutex<Plugin>>, link: Option<(ControlLink, String)>) -> Self {
         Self {
             plugin,
+            link,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -159,11 +171,14 @@ impl PluginWindow {
     /// Open the plugin window
     pub fn open(&mut self) -> Result<()> {
         // Check if plugin has editor
-        let has_editor = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .has_editor();
+        let has_editor = match &self.link {
+            Some((link, _)) => link.has_editor(),
+            None => self
+                .plugin
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_editor(),
+        };
         if !has_editor {
             return Err(Error::Other(
                 "Plugin does not have a GUI editor".to_string(),
@@ -177,12 +192,16 @@ impl PluginWindow {
         }
 
         // Get plugin info for window title
-        let plugin_info = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .info()
-            .clone();
+        let plugin_name = match &self.link {
+            Some((_, name)) => name.clone(),
+            None => self
+                .plugin
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .info()
+                .name
+                .clone(),
+        };
 
         // The native window opens at a placeholder size and is fitted to the editor once it is
         // attached, from the attached view's own size. Asking for the size first would make the
@@ -223,7 +242,7 @@ impl PluginWindow {
             // SAFETY: standard AppKit setter on the main thread.
             unsafe { window.setReleasedWhenClosed(false) };
 
-            let title = NSString::from_str(&format!("{} - VST3", plugin_info.name));
+            let title = NSString::from_str(&format!("{} - VST3", plugin_name));
             window.setTitle(&title);
 
             // A container view, sized to the editor, that the plugin attaches its view into.
@@ -245,11 +264,7 @@ impl PluginWindow {
                     Retained::as_ptr(&container_view) as *mut std::ffi::c_void
                 )
             };
-            let (width, height) = {
-                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
-                plugin.open_editor(window_handle)?;
-                plugin.get_editor_size().unwrap_or((width, height))
-            };
+            let (width, height) = self.attach(window_handle)?.unwrap_or((width, height));
 
             // Match the window to the editor size, then show and center it.
             let size = NSSize::new(width as f64, height as f64);
@@ -282,7 +297,7 @@ impl PluginWindow {
                 RegisterClassExW(&wc);
 
                 // Create window
-                let window_title = format!("{} - VST3\0", plugin_info.name);
+                let window_title = format!("{} - VST3\0", plugin_name);
                 let window_name = window_title.encode_utf16().collect::<Vec<u16>>();
 
                 // Calculate window size including borders
@@ -393,7 +408,7 @@ impl PluginWindow {
                 .map_err(|e| Error::Other(format!("Failed to create X11 window: {e}")))?;
 
             // Window title.
-            let title = format!("{} - VST3", plugin_info.name);
+            let title = format!("{} - VST3", plugin_name);
             connection.send_request(&xcb::x::ChangeProperty {
                 mode: xcb::x::PropMode::Replace,
                 window,
@@ -407,11 +422,7 @@ impl PluginWindow {
             // placeholder's, as the macOS and Windows arms do.
             let _ = connection.flush();
             let handle = crate::plugin::WindowHandle::from_x11(window.resource_id());
-            let size = {
-                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
-                plugin.open_editor(handle)?;
-                plugin.get_editor_size()
-            };
+            let size = self.attach(handle)?;
 
             self.native_window = Some(XcbWindowState { connection, window });
             if let Ok((width, height)) = size {
@@ -456,6 +467,18 @@ impl PluginWindow {
         if self.native_window.is_none() {
             return Ok(());
         }
+        if let Some((link, _)) = &self.link {
+            let scale_result = self
+                .take_pending_scale_factor()
+                .map(|factor| link.set_editor_scale_factor(factor));
+            if let Some((width, height)) = link.take_editor_resize_request() {
+                self.resize_native_window(width, height);
+            }
+            return match scale_result {
+                Some(Err(error)) => Err(error),
+                _ => Ok(()),
+            };
+        }
         let Some(mut plugin) = self.try_lock_plugin() else {
             return Ok(());
         };
@@ -475,6 +498,25 @@ impl PluginWindow {
         match scale_result {
             Some(Err(error)) => Err(error),
             _ => Ok(()),
+        }
+    }
+
+    /// Attach the editor to `handle` and return the size it opened at: the plugin's own error
+    /// when it does not attach, the size query's when only that fails.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn attach(&self, handle: WindowHandle) -> Result<Result<(i32, i32)>> {
+        match &self.link {
+            Some((link, _)) => {
+                link.open_editor(handle)?;
+                Ok(link
+                    .editor_size()
+                    .unwrap_or_else(|| Err(Error::Other("the editor closed".to_string()))))
+            }
+            None => {
+                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
+                plugin.open_editor(handle)?;
+                Ok(plugin.get_editor_size())
+            }
         }
     }
 
@@ -580,11 +622,14 @@ impl PluginWindow {
         // A poisoned lock (an earlier panic on the audio thread) is recovered rather than
         // skipped, exactly as every other lock site here does: skipping it would destroy the
         // native window with the plugin's view still attached to it.
-        let _ = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .close_editor();
+        let _ = match &self.link {
+            Some((link, _)) => link.close_editor(),
+            None => self
+                .plugin
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .close_editor(),
+        };
 
         // Then close the native window
         #[cfg(target_os = "macos")]
