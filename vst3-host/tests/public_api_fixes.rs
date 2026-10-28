@@ -21,8 +21,15 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// Write `script` as an executable `vst3-host-probe` in `dir`.
+///
+/// DF-B179.
+/// Takes `probe_env_guard()`'s guard by reference, so a test that writes a script without holding it does not compile.
 #[cfg(unix)]
-fn write_fake_probe(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
+fn write_fake_probe(
+    _env: &std::sync::MutexGuard<'static, ()>,
+    dir: &std::path::Path,
+    script: &str,
+) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let probe = dir.join("vst3-host-probe");
     std::fs::write(&probe, script).expect("write fake probe");
@@ -51,7 +58,7 @@ fn probe_timeout_holds_when_a_grandchild_inherits_the_stdout_pipe() {
     let dir = scratch_dir("probe-grandchild");
 
     // The "probe" leaves a long-lived grandchild holding stdout, then exits immediately.
-    let probe = write_fake_probe(&dir, "#!/bin/sh\nsleep 30 &\nexit 0\n");
+    let probe = write_fake_probe(&_env, &dir, "#!/bin/sh\nsleep 30 &\nexit 0\n");
     let scan = dir.join("scan");
     std::fs::create_dir_all(&scan).expect("mk scan dir");
     fake_bundle(&scan, "daemon.vst3");
@@ -93,7 +100,7 @@ fn probe_timeout_holds_when_the_probe_hangs_with_a_pipe_holding_grandchild() {
     let _env = probe_env_guard();
     let dir = scratch_dir("probe-hang");
 
-    let probe = write_fake_probe(&dir, "#!/bin/sh\nsleep 30 &\nsleep 30\n");
+    let probe = write_fake_probe(&_env, &dir, "#!/bin/sh\nsleep 30 &\nsleep 30\n");
     let bundle = fake_bundle(&dir, "hangs.vst3");
 
     std::env::set_var("VST3_HOST_PROBE_PATH", &probe);

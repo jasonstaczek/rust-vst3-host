@@ -28,7 +28,9 @@ struct FakeHelper {
 }
 
 impl FakeHelper {
-    fn new(name: &str, body: &str) -> Self {
+    /// DF-B179.
+    /// Takes `serial()`'s guard by reference, so a test that writes a script without holding it does not compile.
+    fn new(_serial: &MutexGuard<'static, ()>, name: &str, body: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("vst3_proto_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("fake-helper");
@@ -58,6 +60,7 @@ impl Drop for FakeHelper {
 fn noise_on_the_protocol_stream_does_not_desync_replies() {
     let _serial = serial();
     let fake = FakeHelper::new(
+        &_serial,
         "noise",
         "n=0\n\
          while IFS= read -r line; do\n\
@@ -90,6 +93,7 @@ fn noise_on_the_protocol_stream_does_not_desync_replies() {
 fn a_large_noise_blob_does_not_break_the_stream() {
     let _serial = serial();
     let fake = FakeHelper::new(
+        &_serial,
         "flood",
         "while IFS= read -r line; do\n\
          \x20 dd if=/dev/zero bs=65536 count=8 2>/dev/null | tr '\\000' 'x'\n\
@@ -114,6 +118,7 @@ fn a_large_noise_blob_does_not_break_the_stream() {
 fn a_helper_dying_mid_response_is_reported_as_a_crash() {
     let _serial = serial();
     let fake = FakeHelper::new(
+        &_serial,
         "truncated",
         "read -r line\n\
          printf '{\"Success\":{\"mess'\n\
@@ -140,6 +145,7 @@ fn a_helper_dying_mid_response_is_reported_as_a_crash() {
 fn shutdown_does_not_wait_for_a_grandchild_holding_the_pipe() {
     let _serial = serial();
     let fake = FakeHelper::new(
+        &_serial,
         "grandchild",
         // The grandchild inherits stdout and outlives the helper by a long way.
         "sleep 30 &\nexit 0\n",
@@ -160,7 +166,7 @@ fn shutdown_does_not_wait_for_a_grandchild_holding_the_pipe() {
 #[test]
 fn load_and_state_commands_get_their_own_deadline() {
     let _serial = serial();
-    let fake = FakeHelper::new("deadlines", "exec sleep 30\n");
+    let fake = FakeHelper::new(&_serial, "deadlines", "exec sleep 30\n");
 
     let mut fast = fake.spawn(Duration::from_millis(150));
     fast.set_slow_command_timeout(Duration::from_millis(1500));
