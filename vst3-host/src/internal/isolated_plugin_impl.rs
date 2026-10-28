@@ -1093,8 +1093,6 @@ unsafe impl Send for IsolatedPluginImpl {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
 
     /// Response deadline for the fake helper below.
     ///
@@ -1124,9 +1122,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("temp dir");
             let script = dir.join("fake-helper");
             let log = dir.join("requests.log");
-            let mut f = std::fs::File::create(&script).expect("script");
-            write!(
-                f,
+            let body = format!(
                 concat!(
                     "#!/bin/sh\n",
                     "while IFS= read -r line; do\n",
@@ -1138,11 +1134,8 @@ mod tests {
                     "done\n"
                 ),
                 log = log.display()
-            )
-            .expect("write script");
-            drop(f);
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            );
+            crate::process_isolation::script_writes::write_executable(&script, &body);
             Self { dir, script, log }
         }
 

@@ -1264,12 +1264,18 @@ impl PluginHostProcess {
 
     /// Spawn the helper at `helper_path` and wire up the response reader thread.
     fn spawn(helper_path: std::path::PathBuf, timeout: Duration) -> Result<Self, String> {
+        // A child made while another thread's script is open for writing inherits that
+        // descriptor, and the script then refuses to exec with ETXTBSY (DF-B177).
+        #[cfg(test)]
+        let spawn_guard = script_writes::before_spawn();
         let mut child = Command::new(&helper_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("Failed to spawn helper process: {}", e))?;
+        #[cfg(test)]
+        drop(spawn_guard);
 
         let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
@@ -1648,6 +1654,42 @@ pub enum IsolationError {
     /// Unexpected response
     #[error("Unexpected response from helper")]
     UnexpectedResponse,
+}
+
+/// Serialises the lib tests' fake-helper writers against every helper spawn, so no child
+/// is made while a script is open for writing (DF-B177).
+#[cfg(test)]
+pub(crate) mod script_writes {
+    use std::path::Path;
+    use std::sync::{RwLock, RwLockReadGuard};
+
+    static LOCK: RwLock<()> = RwLock::new(());
+
+    /// Held by a spawn across `Command::spawn`, so no writer is mid-write while a child forks.
+    pub(crate) fn before_spawn() -> RwLockReadGuard<'static, ()> {
+        LOCK.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs `write` with the write side held and returns once the closure has dropped its
+    /// descriptor. The closure must close the file before it returns.
+    pub(crate) fn exclusive<R>(write: impl FnOnce() -> R) -> R {
+        let _held = LOCK.write().unwrap_or_else(|e| e.into_inner());
+        write()
+    }
+
+    /// Writes `body` to `path` and marks it executable, with the descriptor closed before the
+    /// write side is let go.
+    #[cfg(unix)]
+    pub(crate) fn write_executable(path: &Path, body: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        exclusive(|| {
+            let mut f = std::fs::File::create(path).expect("create script");
+            f.write_all(body.as_bytes()).expect("write script");
+            drop(f);
+        });
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
 }
 
 #[cfg(test)]
@@ -2574,25 +2616,71 @@ mod wire_tests {
         assert!(!is_slow_command(&HostCommand::GetAllParameters));
     }
 
+    /// DF-B177. A spawn waits while another thread has a script open for writing: that
+    /// child would inherit the descriptor and the script's own exec would fail with ETXTBSY.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_waits_while_another_script_is_open_for_writing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("vst3_spawnlock_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("other-helper");
+        script_writes::write_executable(&other, "#!/bin/sh\nexec sleep 30\n");
+
+        let (held_tx, held_rx) = mpsc::channel();
+        let (let_go_tx, let_go_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            script_writes::exclusive(|| {
+                held_tx.send(()).unwrap();
+                let_go_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let spawner = {
+            let returned = Arc::clone(&returned);
+            let other = other.clone();
+            std::thread::spawn(move || {
+                let proc = PluginHostProcess::spawn(other, Duration::from_millis(200));
+                returned.store(true, Ordering::SeqCst);
+                proc
+            })
+        };
+
+        // The spawn has no reason to take this long unless it is waiting on the writer.
+        std::thread::sleep(Duration::from_millis(500));
+        let early = returned.load(Ordering::SeqCst);
+        let_go_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let mut proc = spawner
+            .join()
+            .unwrap()
+            .expect("spawn after the writer let go");
+        let _ = proc.send_command(HostCommand::Shutdown);
+        assert!(
+            !early,
+            "a helper was spawned while another script was open for writing"
+        );
+    }
+
     /// A helper that never responds (a hung plugin) must not hang the host: `send_command`
     /// returns an error within the timeout and kills the child.
     #[cfg(unix)]
     #[test]
     fn hung_helper_times_out_and_is_killed_not_blocking() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         // Fake helper: read nothing, write nothing, just sleep — i.e. hang forever.
         let dir = std::env::temp_dir().join(format!("vst3_hang_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("hung-helper");
-        let mut f = std::fs::File::create(&fake).unwrap();
         // `exec` so the shell is replaced by sleep (no orphaned child holding the stdout
         // pipe); killing the helper then closes the pipe and ends the reader thread promptly.
-        writeln!(f, "#!/bin/sh\nexec sleep 30").unwrap();
-        drop(f);
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_writes::write_executable(&fake, "#!/bin/sh\nexec sleep 30\n");
 
         let mut proc =
             PluginHostProcess::spawn(fake.clone(), Duration::from_millis(200)).expect("spawn");
@@ -2627,9 +2715,6 @@ mod wire_tests {
     #[cfg(unix)]
     impl FlakyLoadHelper {
         fn new(name: &str, crashing_loads: u32) -> Self {
-            use std::io::Write;
-            use std::os::unix::fs::PermissionsExt;
-
             let dir = std::env::temp_dir().join(format!(
                 "vst3_flaky_{name}_{}_{:?}",
                 std::process::id(),
@@ -2640,12 +2725,10 @@ mod wire_tests {
             let script = dir.join("flaky-helper");
             let attempts = dir.join("attempts");
 
-            let mut f = std::fs::File::create(&script).expect("create script");
             // Every LoadPlugin bumps a shared counter; the first `crashing_loads` of them make
             // the helper exit without answering, which is what a plugin crashing inside its own
             // initialization looks like from the host's side.
-            write!(
-                f,
+            let body = format!(
                 "#!/bin/sh\n\
                  while IFS= read -r line; do\n\
                  \x20 case \"$line\" in\n\
@@ -2660,11 +2743,8 @@ mod wire_tests {
                  done\n",
                 attempts = attempts.display(),
                 crashing_loads = crashing_loads,
-            )
-            .expect("write script");
-            drop(f);
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            );
+            script_writes::write_executable(&script, &body);
             Self {
                 dir,
                 script,
