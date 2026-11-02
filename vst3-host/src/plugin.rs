@@ -841,6 +841,32 @@ pub struct Plugin {
 }
 
 // Internal trait for hiding implementation details
+/// One block's host transport, as [`Plugin::set_host_transport`] writes it into the
+/// plugin's `ProcessContext`. Positions in quarter notes are `f64` as VST 3 counts them;
+/// each `Option` sets its validity bit when `Some` and clears both field and bit when `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HostTransport {
+    /// `kPlaying`.
+    pub playing: bool,
+    /// `projectTimeSamples`: the block's first frame on the host's timeline, in samples.
+    pub project_time_samples: i64,
+    /// `tempo` in beats per minute, with `kTempoValid`; a value that is not finite and
+    /// positive is treated as `None`.
+    pub tempo: Option<f64>,
+    /// `projectTimeMusic`, the block's first frame in quarter notes, with
+    /// `kProjectTimeMusicValid`.
+    pub project_time_music: Option<f64>,
+    /// `barPositionMusic`, the start of the bar holding the block's first frame in quarter
+    /// notes, with `kBarPositionValid`.
+    pub bar_position_music: Option<f64>,
+    /// `timeSigNumerator` and `timeSigDenominator`, with `kTimeSigValid`.
+    pub time_signature: Option<(i32, i32)>,
+    /// `kCycleActive`: the host is looping.
+    pub cycle_active: bool,
+    /// `cycleStartMusic` and `cycleEndMusic` in quarter notes, with `kCycleValid`.
+    pub cycle_music: Option<(f64, f64)>,
+}
+
 pub(crate) trait PluginInternal: Send {
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()>;
     /// Schedule a parameter change at a sample offset within the next process block.
@@ -943,6 +969,13 @@ pub(crate) trait PluginInternal: Send {
     fn set_playing(&mut self, _playing: bool) -> Result<()> {
         Err(Error::Other(
             "runtime transport mutation is not supported for this plugin".to_string(),
+        ))
+    }
+    /// Hand the next processed block its whole host `ProcessContext` (see
+    /// [`Plugin::set_host_transport`]). Defaults to unsupported.
+    fn set_host_transport(&mut self, _transport: &HostTransport) -> Result<()> {
+        Err(Error::Other(
+            "a host-driven transport is not supported for this plugin".to_string(),
         ))
     }
     fn send_midi_event(&mut self, event: MidiEvent) -> Result<()>;
@@ -1566,6 +1599,22 @@ impl Plugin {
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
             .set_playing(playing)
+    }
+
+    /// Hand the plugin the whole host `ProcessContext` from the **next** processed block on,
+    /// replacing the library's own transport: before every block the library writes exactly
+    /// these fields and validity bits, over its own advance and over the tempo, time
+    /// signature and playing flag [`Self::set_tempo`] and its siblings keep, until the next
+    /// call. The position does not move until the host moves it. A field that is `None` is
+    /// left clear and its validity bit unset; a block split into chunks gives later chunks
+    /// the sample moved by their offset and no musical position. In-process only: across
+    /// process isolation it is refused. It neither allocates nor frees on success, so it may
+    /// be called on the audio thread.
+    pub fn set_host_transport(&mut self, transport: &HostTransport) -> Result<()> {
+        match self.internal.as_mut() {
+            Some(internal) => internal.set_host_transport(transport),
+            None => Err(Error::Other("Plugin not initialized".to_string())),
+        }
     }
 
     /// Enumerate the plugin's units and their program lists (`IUnitInfo`).

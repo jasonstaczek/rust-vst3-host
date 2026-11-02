@@ -8,6 +8,14 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ### Fixed
 
+- **A host can tell a plugin its whole transport, and the library tells none of its own.**
+  `Plugin::set_host_transport` hands over a `HostTransport` that the library writes into
+  the `ProcessContext` before every later block: the playing flag, `projectTimeSamples`,
+  and, each with its validity bit only when given, the tempo, `projectTimeMusic`,
+  `barPositionMusic`, the time signature and the cycle. The position stays where the host
+  put it, and no default 120 bpm, 4/4 or self-counted playhead reaches the plugin as valid.
+  It neither allocates nor frees, and is in-process only. The library's own transport is
+  unchanged for a host that never calls it.
 - **The audio thread no longer waits on a plugin editor's `performEdit`.** `process` drained
   the editor's edits under a blocking lock that `performEdit` takes on the editor's thread.
   It now uses `try_lock`; a held lock leaves the edits for the next block, so none is lost.

@@ -112,9 +112,9 @@ pub use playback::{
 };
 pub use plugin::{
     AutomationState, BuiltCaches, CacheRebuild, ContextMenuItem, DataExchangeBlock,
-    HostNotification, OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin, PluginInfo,
-    PluginPreset, PluginUnit, ProcessMode, ProgramPitchName, ProgressKind, ProgressValue,
-    ReplacedCaches, RestartFlags, StateContext, WindowHandle,
+    HostNotification, HostTransport, OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin,
+    PluginInfo, PluginPreset, PluginUnit, ProcessMode, ProgramPitchName, ProgressKind,
+    ProgressValue, ReplacedCaches, RestartFlags, StateContext, WindowHandle,
 };
 pub use realtime::{RealtimePluginRunner, RtControl};
 pub use transport::{AutomationLane, BlockEvents, MidiClip, Timeline};

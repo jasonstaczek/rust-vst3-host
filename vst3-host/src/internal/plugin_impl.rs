@@ -427,6 +427,10 @@ pub struct PluginImpl {
     time_sig_denominator: i32,
     /// Whether the transport is playing (the `kPlaying` flag in `ProcessContext.state`).
     playing: bool,
+    /// The host's own transport once it has handed one over: from then on it is written into
+    /// the context before every processed chunk, over the fields above and the library's own
+    /// advance.
+    host_transport: Option<crate::plugin::HostTransport>,
     /// Real-time vs offline processing, baked into `ProcessSetup`/`process_data` at setup.
     process_mode: crate::plugin::ProcessMode,
     /// Optional VST3 3.7 declaration of exactly which ProcessContext fields the processor reads.
@@ -1873,6 +1877,7 @@ impl PluginImpl {
                 time_sig_numerator: 4,
                 time_sig_denominator: 4,
                 playing: true,
+                host_transport: None,
                 process_mode: crate::plugin::ProcessMode::Realtime,
                 process_context_requirements,
                 prefetchable_support,
@@ -2461,6 +2466,9 @@ impl PluginImpl {
         is_last: bool,
     ) -> Result<()> {
         if let Some(ref mut data) = self.process_data {
+            if let Some(transport) = &self.host_transport {
+                write_host_transport(&mut data.process_context, transport, frame_offset as i64);
+            }
             unsafe {
                 // Clear output events only - input events should be preserved for processing
                 self.output_events.clear();
@@ -2813,6 +2821,11 @@ impl PluginInternal for PluginImpl {
 
     fn set_playing(&mut self, playing: bool) -> Result<()> {
         self.update_playing(playing);
+        Ok(())
+    }
+
+    fn set_host_transport(&mut self, transport: &crate::plugin::HostTransport) -> Result<()> {
+        self.host_transport = Some(*transport);
         Ok(())
     }
 
@@ -5563,6 +5576,55 @@ fn current_system_time_nanos() -> i64 {
         .unwrap_or_default()
 }
 
+/// Write a host's transport into `ctx` for a chunk starting `frame_offset` frames into the
+/// host's block, every field but the sample rate: each field the host does not give is zero
+/// and its validity bit clear, so nothing of the library's own transport (a default tempo,
+/// a time signature, an advanced playhead) survives. A later chunk's sample moves by its
+/// offset, and its musical positions, given for the block's first frame, are not told.
+#[allow(clippy::unnecessary_cast)] // the `as u32` is needed where the constants are i32 (Windows)
+fn write_host_transport(
+    ctx: &mut ProcessContext,
+    transport: &crate::plugin::HostTransport,
+    frame_offset: i64,
+) {
+    use ProcessContext_::StatesAndFlags_ as S;
+    let first = frame_offset == 0;
+    let music = transport.project_time_music.filter(|_| first);
+    let bar = transport.bar_position_music.filter(|_| first);
+    let tempo = transport.tempo.filter(|t| t.is_finite() && *t > 0.0);
+    let (numerator, denominator) = transport.time_signature.unwrap_or((0, 0));
+    let (cycle_start, cycle_end) = transport.cycle_music.unwrap_or((0.0, 0.0));
+    ctx.projectTimeSamples = transport.project_time_samples.wrapping_add(frame_offset);
+    ctx.systemTime = 0;
+    ctx.continousTimeSamples = 0;
+    ctx.projectTimeMusic = music.unwrap_or(0.0);
+    ctx.barPositionMusic = bar.unwrap_or(0.0);
+    ctx.cycleStartMusic = cycle_start;
+    ctx.cycleEndMusic = cycle_end;
+    ctx.tempo = tempo.unwrap_or(0.0);
+    ctx.timeSigNumerator = numerator;
+    ctx.timeSigDenominator = denominator;
+    // SAFETY: `Chord` is plain C data, valid all-zero.
+    ctx.chord = unsafe { std::mem::zeroed() };
+    ctx.smpteOffsetSubframes = 0;
+    // SAFETY: `FrameRate` is plain C data, valid all-zero.
+    ctx.frameRate = unsafe { std::mem::zeroed() };
+    ctx.samplesToNextClock = 0;
+    let flags = [
+        (transport.playing, S::kPlaying as u32),
+        (tempo.is_some(), S::kTempoValid as u32),
+        (music.is_some(), S::kProjectTimeMusicValid as u32),
+        (bar.is_some(), S::kBarPositionValid as u32),
+        (transport.time_signature.is_some(), S::kTimeSigValid as u32),
+        (transport.cycle_active, S::kCycleActive as u32),
+        (transport.cycle_music.is_some(), S::kCycleValid as u32),
+    ];
+    ctx.state = flags
+        .iter()
+        .filter(|(given, _)| *given)
+        .fold(0, |state, (_, flag)| state | flag);
+}
+
 /// Advance the transport in a `ProcessContext` by `frames` samples after a processed block.
 /// Keeps `continousTimeSamples`/`projectTimeSamples` (and the musical playhead derived from
 /// the current tempo) moving so tempo-synced plugins don't see a frozen time-0.
@@ -5812,6 +5874,73 @@ mod process_buffer_tests {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)] // `as u32` needed where the constants are i32 (Windows)
+    fn a_host_transport_sets_only_the_bits_it_gives() {
+        use ProcessContext_::StatesAndFlags_ as F;
+        // SAFETY: `ProcessContext` is plain C data, valid all-zero.
+        let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
+        ctx.sampleRate = 48_000.0;
+        ctx.tempo = 120.0;
+        ctx.continousTimeSamples = 99;
+        let told = crate::plugin::HostTransport {
+            playing: true,
+            project_time_samples: -64,
+            tempo: Some(90.056),
+            project_time_music: Some(-0.25),
+            bar_position_music: Some(-3.5),
+            time_signature: Some((7, 8)),
+            cycle_active: true,
+            cycle_music: Some((1.0, 4.0)),
+        };
+        write_host_transport(&mut ctx, &told, 0);
+        assert_eq!(
+            ctx.state,
+            (F::kPlaying
+                | F::kTempoValid
+                | F::kProjectTimeMusicValid
+                | F::kBarPositionValid
+                | F::kTimeSigValid
+                | F::kCycleActive
+                | F::kCycleValid) as u32
+        );
+        assert_eq!(
+            (
+                ctx.sampleRate,
+                ctx.projectTimeSamples,
+                ctx.tempo,
+                ctx.continousTimeSamples
+            ),
+            (48_000.0, -64, 90.056, 0)
+        );
+        assert_eq!((ctx.timeSigNumerator, ctx.timeSigDenominator), (7, 8));
+        assert_eq!((ctx.cycleStartMusic, ctx.cycleEndMusic), (1.0, 4.0));
+
+        let untold = crate::plugin::HostTransport {
+            project_time_samples: 4_800,
+            tempo: Some(f64::NAN),
+            ..Default::default()
+        };
+        write_host_transport(&mut ctx, &untold, 0);
+        assert_eq!(ctx.state, 0, "no tempo is no tempo bit, never a default");
+        assert_eq!(
+            (ctx.tempo, ctx.timeSigNumerator, ctx.projectTimeSamples),
+            (0.0, 0, 4_800)
+        );
+
+        // A second chunk of the same block: the sample moves, the musical positions are not told.
+        write_host_transport(&mut ctx, &told, 32);
+        assert_eq!(ctx.projectTimeSamples, -32);
+        assert_eq!(
+            ctx.state & (F::kProjectTimeMusicValid | F::kBarPositionValid) as u32,
+            0
+        );
+        assert_eq!(
+            ctx.state & (F::kTempoValid | F::kTimeSigValid | F::kCycleValid) as u32,
+            (F::kTempoValid | F::kTimeSigValid | F::kCycleValid) as u32
+        );
+    }
 
     #[test]
     #[allow(clippy::unnecessary_cast)] // `as u32` needed where the constants are i32 (Windows)
