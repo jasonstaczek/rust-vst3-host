@@ -1997,6 +1997,10 @@ mod wire_tests {
             name: "Root".to_string(),
             program_list_id: Some(12),
             programs: vec!["Init".to_string(), "Lead".to_string()],
+            program_attributes: vec![
+                Vec::new(),
+                vec![("MusicalInstrument".to_string(), "Synth|Lead".to_string())],
+            ],
         }];
         let resp = HostResponse::Units {
             units: units.clone(),

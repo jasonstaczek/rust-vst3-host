@@ -3889,9 +3889,15 @@ impl PluginInternal for PluginImpl {
             return Ok(Vec::new());
         };
         unsafe {
-            // First resolve program lists (id -> program names), then attach to units.
-            let mut lists: std::collections::HashMap<i32, Vec<String>> =
+            // First resolve program lists (id -> program names and attributes), then attach
+            // to units.
+            type Attributes = Vec<Vec<(String, String)>>;
+            let mut lists: std::collections::HashMap<i32, (Vec<String>, Attributes)> =
                 std::collections::HashMap::new();
+            let attribute_ids: Vec<std::ffi::CString> = crate::plugin::PROGRAM_ATTRIBUTES
+                .iter()
+                .map(|id| std::ffi::CString::new(*id).expect("no NUL in an attribute id"))
+                .collect();
             let list_count = unit_info.getProgramListCount();
             for i in 0..list_count {
                 let mut pl: ProgramListInfo = std::mem::zeroed();
@@ -3899,6 +3905,7 @@ impl PluginInternal for PluginImpl {
                     continue;
                 }
                 let mut programs = Vec::with_capacity(pl.programCount.max(0) as usize);
+                let mut attributes = Vec::with_capacity(pl.programCount.max(0) as usize);
                 for p in 0..pl.programCount {
                     let mut name: String128 = std::mem::zeroed();
                     let s = if unit_info.getProgramName(pl.id, p, &mut name) == kResultOk {
@@ -3907,8 +3914,21 @@ impl PluginInternal for PluginImpl {
                         String::new()
                     };
                     programs.push(s);
+                    let mut said = Vec::new();
+                    for (id, c_id) in crate::plugin::PROGRAM_ATTRIBUTES.iter().zip(&attribute_ids) {
+                        let mut value: String128 = std::mem::zeroed();
+                        if unit_info.getProgramInfo(pl.id, p, c_id.as_ptr(), &mut value)
+                            == kResultOk
+                        {
+                            let value = crate::internal::utils::vst_string_to_string(&value);
+                            if !value.is_empty() {
+                                said.push(((*id).to_string(), value));
+                            }
+                        }
+                    }
+                    attributes.push(said);
                 }
-                lists.insert(pl.id, programs);
+                lists.insert(pl.id, (programs, attributes));
             }
 
             let unit_count = unit_info.getUnitCount();
@@ -3918,13 +3938,15 @@ impl PluginInternal for PluginImpl {
                 if unit_info.getUnitInfo(i, &mut ui) != kResultOk {
                     continue;
                 }
-                let programs = lists.get(&ui.programListId).cloned().unwrap_or_default();
+                let (programs, program_attributes) =
+                    lists.get(&ui.programListId).cloned().unwrap_or_default();
                 units.push(PluginUnit {
                     id: ui.id,
                     parent_id: ui.parentUnitId,
                     name: crate::internal::utils::vst_string_to_string(&ui.name),
                     program_list_id: (ui.programListId >= 0).then_some(ui.programListId),
                     programs,
+                    program_attributes,
                 });
             }
             *self

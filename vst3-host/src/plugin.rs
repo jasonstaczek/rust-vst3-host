@@ -316,7 +316,17 @@ pub struct PluginUnit {
     pub program_list_id: Option<i32>,
     /// Program names in this unit's program list (empty if the unit has none).
     pub programs: Vec<String>,
+    /// Per program, in [`programs`](Self::programs)' order, the attributes of
+    /// [`PROGRAM_ATTRIBUTES`] that `IUnitInfo::getProgramInfo` answers, as `(attribute,
+    /// value)`; an attribute the plugin refuses or leaves empty is left out. Empty for a
+    /// unit with no program list.
+    #[serde(default)]
+    pub program_attributes: Vec<Vec<(String, String)>>,
 }
+
+/// The `PresetAttributes` a unit's programs are asked for: the musical instrument, style
+/// and character a plugin files each program under, often `|`-joined (`Synth|Pad`).
+pub const PROGRAM_ATTRIBUTES: [&str; 3] = ["MusicalInstrument", "MusicalStyle", "MusicalCharacter"];
 
 /// A plugin-provided name for a MIDI pitch in a particular program.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

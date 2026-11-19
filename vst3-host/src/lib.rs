@@ -114,7 +114,7 @@ pub use plugin::{
     AutomationState, BuiltCaches, CacheRebuild, ContextMenuItem, DataExchangeBlock,
     HostNotification, HostTransport, OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin,
     PluginInfo, PluginPreset, PluginUnit, ProcessMode, ProgramPitchName, ProgressKind,
-    ProgressValue, ReplacedCaches, RestartFlags, StateContext, WindowHandle,
+    ProgressValue, ReplacedCaches, RestartFlags, StateContext, WindowHandle, PROGRAM_ATTRIBUTES,
 };
 pub use realtime::{RealtimePluginRunner, RtControl};
 pub use transport::{AutomationLane, BlockEvents, MidiClip, Timeline};
